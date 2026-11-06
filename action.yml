@@ -1,8 +1,8 @@
-name: Claude Dependabot Reviewer
+name: Claude Dependabot Gate
 description: >-
-  Uses Claude to review a Dependabot pull request: works out what changed upstream,
-  finds where this repository uses the dependency, optionally runs your tests, and
-  posts a risk report with a low / medium / high label.
+  A merge gate for Dependabot pull requests: builds and tests the merge result, has
+  Claude check the upstream changes against your code and its test coverage, and
+  gives a pass, needs-human or fail verdict.
 author: Agility by Nature
 branding:
   icon: shield
@@ -34,8 +34,9 @@ inputs:
     default: "30"
   test-command:
     description: >-
-      Optional shell command that builds and tests the PR (for example `npm ci && npm test`).
-      It runs in the workspace, and Claude reads the result. Leave empty to skip.
+      Shell command that builds and tests the PR (for example `npm ci && npm test`).
+      It runs in the workspace, and Claude reads the result. Without it the verdict can
+      never be a pass.
     required: false
     default: ""
   test-timeout-minutes:
@@ -47,19 +48,31 @@ inputs:
     required: false
     default: "true"
   add-labels:
-    description: Add a risk label to the PR, such as dependabot-risk:low.
+    description: Add a verdict label to the PR, such as dependabot-review:pass.
     required: false
     default: "true"
   label-prefix:
-    description: Prefix for risk labels.
+    description: Prefix for verdict labels.
     required: false
-    default: "dependabot-risk:"
-  fail-on-risk:
+    default: "dependabot-review:"
+  fail-on:
     description: >-
-      Fail this step when the risk is at or above this level: none, medium or high.
-      Use it to make the review a required check.
+      When the check fails. `fail` (default) fails only on a failing verdict, so people
+      can still merge needs-human PRs after reading the review. `needs-human` fails on
+      anything short of a pass. `never` always succeeds.
     required: false
-    default: none
+    default: fail
+  auto-merge:
+    description: >-
+      Turn on GitHub auto-merge when the verdict is pass, and turn it off when a later
+      push does not pass. Needs `contents: write`, "Allow auto-merge" in the repo
+      settings, and branch protection with required checks.
+    required: false
+    default: "false"
+  auto-merge-method:
+    description: "squash, merge or rebase."
+    required: false
+    default: squash
   allowed-authors:
     description: >-
       Comma-separated PR authors to review. Other PRs are skipped. Add
@@ -72,8 +85,11 @@ inputs:
     default: ""
 
 outputs:
+  verdict:
+    description: "pass, needs-human or fail."
+    value: ${{ steps.review.outputs.verdict }}
   risk:
-    description: "low, medium, high, or unknown (the review could not be completed)."
+    description: "Claude's risk rating: low, medium, high, or unknown (the review could not be completed)."
     value: ${{ steps.review.outputs.risk }}
   confidence:
     description: "Claude's confidence in the verdict: low, medium or high."
@@ -114,7 +130,9 @@ runs:
         INPUT_POST_COMMENT: ${{ inputs.post-comment }}
         INPUT_ADD_LABELS: ${{ inputs.add-labels }}
         INPUT_LABEL_PREFIX: ${{ inputs.label-prefix }}
-        INPUT_FAIL_ON_RISK: ${{ inputs.fail-on-risk }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_AUTO_MERGE: ${{ inputs.auto-merge }}
+        INPUT_AUTO_MERGE_METHOD: ${{ inputs.auto-merge-method }}
         INPUT_ALLOWED_AUTHORS: ${{ inputs.allowed-authors }}
         INPUT_PR_NUMBER: ${{ inputs.pr-number }}
       # -P stops Python from putting the working directory (the PR's code) on sys.path,

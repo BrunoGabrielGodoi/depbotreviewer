@@ -20,9 +20,10 @@ class GitHubError(Exception):
 
 
 class GitHub:
-    def __init__(self, token: str, api_url: str, repository: str):
+    def __init__(self, token: str, api_url: str, repository: str, graphql_url: str | None = None):
         self._token = token
         self._api = api_url.rstrip("/")
+        self._graphql = graphql_url or f"{self._api}/graphql"
         self.repository = repository
 
     def _request(self, method: str, path: str, body: Any = None) -> Any:
@@ -100,3 +101,23 @@ class GitHub:
                         raise
         if label not in current:
             self._request("POST", self._repo(f"/issues/{number}/labels"), {"labels": [label]})
+
+    def _graphql_mutation(self, query: str, variables: dict) -> Any:
+        result = self._request("POST", self._graphql, {"query": query, "variables": variables})
+        if result.get("errors"):
+            raise GitHubError(200, "; ".join(e.get("message", "") for e in result["errors"]))
+        return result["data"]
+
+    def enable_auto_merge(self, pr_node_id: str, method: str) -> None:
+        """Merge once all required checks pass. Fails if the PR has no pending requirements."""
+        self._graphql_mutation(
+            "mutation($id: ID!, $method: PullRequestMergeMethod!) {"
+            " enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: $method}) { clientMutationId } }",
+            {"id": pr_node_id, "method": method.upper()},
+        )
+
+    def disable_auto_merge(self, pr_node_id: str) -> None:
+        self._graphql_mutation(
+            "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }",
+            {"id": pr_node_id},
+        )

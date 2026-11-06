@@ -57,8 +57,17 @@ check a signature.
 4. Cross-reference: for each upstream change that matters, decide whether the code you \
 found is affected, and cite the file and line. Check that the repository's declared \
 runtime versions still meet the new requirements.
-5. Weigh the test results if tests were run, including whether the tests actually \
-exercise the affected code. A pass is weaker evidence when the affected code has no tests.
+5. For every affected call site you list in impacted_code, find out whether the \
+existing tests exercise it. Set covered_by_tests to "yes" only when you found a specific \
+test that runs that code path; "no" when you looked and found none; "unknown" when you \
+could not tell. This decides whether the update can merge without a human, so do not \
+guess "yes".
+6. Weigh the test results if tests were run. If they failed, work out from the log \
+whether the update caused the failure, and say so in test_assessment.
+
+List every call site that uses an API whose behavior, signature or defaults changed in \
+these versions, even if you believe it is unaffected, so that its test coverage is \
+checked. Leave impacted_code empty only when the repository uses nothing that changed.
 
 Risk levels:
 - low: no upstream change touches anything this repository uses, runtime requirements \
@@ -108,7 +117,7 @@ def is_lockfile(path: str) -> bool:
     return PurePosixPath(path).name.lower() in LOCKFILE_NAMES
 
 
-def build_user_message(pr: dict, files: list[dict], test: CheckRun | None) -> str:
+def build_user_message(pr: dict, files: list[dict], test: CheckRun | None, checkout: str) -> str:
     parts: list[str] = []
     parts.append(
         "Review this dependency update pull request.\n\n"
@@ -116,7 +125,8 @@ def build_user_message(pr: dict, files: list[dict], test: CheckRun | None) -> st
         f"Author: {pr.get('user', {}).get('login', '')}\n"
         f"Base branch: {pr.get('base', {}).get('ref', '')}\n"
         f"Head branch: {pr.get('head', {}).get('ref', '')}\n"
-        f"Labels: {', '.join(l['name'] for l in pr.get('labels', [])) or 'none'}"
+        f"Labels: {', '.join(l['name'] for l in pr.get('labels', [])) or 'none'}\n"
+        f"Workspace (what your file tools read and what the tests ran on): {checkout}"
     )
 
     body = (pr.get("body") or "").strip() or "(empty)"

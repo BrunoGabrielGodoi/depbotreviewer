@@ -59,11 +59,12 @@ REVIEW_SCHEMA: dict = {
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["file", "line", "description"],
+                "required": ["file", "line", "description", "covered_by_tests"],
                 "properties": {
                     "file": {"type": "string"},
                     "line": {"type": "integer", "description": "1-based line, or 0 for the whole file."},
                     "description": {"type": "string"},
+                    "covered_by_tests": {"type": "string", "enum": ["yes", "no", "unknown"]},
                 },
             },
         },

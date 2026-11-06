@@ -1,34 +1,39 @@
-# Copy to .github/workflows/dependabot-review.yml in the repository you want reviewed.
+# Copy to .github/workflows/dependabot-review.yml in the repository you want gated.
 #
 # Setup:
 #   1. Add ANTHROPIC_API_KEY under Settings > Secrets and variables > Dependabot.
 #      (Dependabot-triggered runs cannot read normal Actions secrets.)
-#   2. Replace the setup and test-command below with whatever builds and tests your project.
-name: Dependabot review
+#   2. Set the toolchain step and test-command below for your project.
+#   3. In branch protection (or a ruleset) for main, require the "dependabot-gate" check, and either
+#      turn on the merge queue or "Require branches to be up to date before merging".
+#      See the README section "Making sure what you tested is what lands".
+name: Dependabot gate
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  merge_group: # re-runs the build and tests on the exact commit the merge queue will land
 
 permissions:
-  contents: read
+  contents: read # change to `write` if you turn on auto-merge
   pull-requests: write # post the review comment
-  issues: write # create and apply risk labels
+  issues: write # create and apply verdict labels
 
 jobs:
-  review:
-    # Check the PR author, not github.actor: a human re-running the job must still trigger the review.
-    if: github.event.pull_request.user.login == 'dependabot[bot]'
+  dependabot-gate:
+    # Pull requests: check the PR author, not github.actor, so a human re-running the job still triggers it.
+    # Merge queue: the action itself skips PRs that are not from Dependabot.
+    if: github.event_name == 'merge_group' || github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     concurrency:
-      group: dependabot-review-${{ github.event.pull_request.number }}
+      group: dependabot-gate-${{ github.event.pull_request.number || github.ref }}
       cancel-in-progress: true
     steps:
+      # No `ref:` on purpose. On pull_request this checks out the PR merged into the
+      # latest base branch, which is what will land. On merge_group it checks out the queue's commit.
       - uses: actions/checkout@v4
         with:
-          # Review the PR's own commit so file links in the comment match.
-          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -45,10 +50,11 @@ jobs:
       - uses: GH-ABN/depbotreviewer@v1
         with:
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-          # Builds and tests the update so Claude can read the result. Examples:
+          # Builds and tests the update. Required for a pass. Examples:
           #   npm ci && npm test
           #   dotnet restore && dotnet build --no-restore && dotnet test --no-build
           #   pip install -r requirements.txt && pytest
           test-command: npm ci && npm test
-          # Make the check fail on high risk (useful as a required status check):
-          # fail-on-risk: high
+          # fail-on: fail          # default: the check fails only when the update breaks something
+          # fail-on: needs-human   # stricter: anything short of a verified pass fails the check
+          # auto-merge: true       # merge automatically on a pass (needs contents: write)
