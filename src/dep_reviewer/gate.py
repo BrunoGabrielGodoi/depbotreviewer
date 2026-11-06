@@ -23,6 +23,7 @@ class Checkout:
     sha: str
     is_merge_result: bool
     description: str
+    base_sha: str | None = None  # the base-branch commit the PR was merged into, when is_merge_result
 
 
 def describe_checkout(root: Path, head_sha: str, base_ref: str) -> Checkout:
@@ -32,7 +33,7 @@ def describe_checkout(root: Path, head_sha: str, base_ref: str) -> Checkout:
     ).stdout.split()
     sha, parents = out[0], out[1:]
     if len(parents) == 2 and parents[1] == head_sha:
-        return Checkout(sha, True, f"the PR merged into {base_ref} at {parents[0][:7]} (merge commit {sha[:7]})")
+        return Checkout(sha, True, f"the PR merged into {base_ref} at {parents[0][:7]} (merge commit {sha[:7]})", parents[0])
     if sha == head_sha:
         return Checkout(sha, False, f"the PR's own commit {sha[:7]}, NOT merged with the latest {base_ref}")
     return Checkout(sha, False, f"commit {sha[:7]}, which is neither the PR head nor its merge result")
@@ -95,3 +96,57 @@ def pr_number_from_queue_ref(ref: str) -> int | None:
     """gh-readonly-queue/main/pr-123-<sha> -> 123 (the last PR in the queue group)."""
     m = _QUEUE_REF.search(ref)
     return int(m.group(1)) if m else None
+
+
+# --- Auto-merge policy -------------------------------------------------------------------
+
+UPDATE_TYPES = ("patch", "minor", "major")
+# Dependabot writes this metadata into its commit messages (what dependabot/fetch-metadata reads):
+#   updated-dependencies:
+#   - dependency-name: ms
+#     dependency-type: direct:production
+#     update-type: version-update:semver-minor
+_UPDATE_TYPE = re.compile(r"^\s*update-type:\s*version-update:semver-(patch|minor|major)\s*$", re.M)
+_DEP_NAME = re.compile(r"^\s*-\s*dependency-name:\s*(\S+)", re.M)
+
+
+@dataclass(frozen=True)
+class UpdateInfo:
+    names: list[str]
+    types: list[str]  # one per dependency; unknown when Dependabot gave none
+
+    @property
+    def worst(self) -> str:
+        if not self.types or len(self.types) < len(self.names) or "unknown" in self.types:
+            return "unknown"
+        return max(self.types, key=UPDATE_TYPES.index)
+
+
+def parse_dependabot_metadata(commit_message: str) -> UpdateInfo:
+    names = _DEP_NAME.findall(commit_message or "")
+    types = _UPDATE_TYPE.findall(commit_message or "")
+    return UpdateInfo(names, types)
+
+
+@dataclass(frozen=True)
+class AutoMergeDecision:
+    merge: bool
+    reason: str
+
+
+def auto_merge_decision(verdict: Verdict, outcome: ReviewOutcome, update: UpdateInfo,
+                        allowed: tuple[str, ...]) -> AutoMergeDecision:
+    """Merge without a human only on a pass, with high confidence, for an allowed update type.
+
+    The update type comes from Dependabot's own metadata, not from Claude.
+    """
+    if verdict.status != PASS:
+        return AutoMergeDecision(False, f"the verdict is {verdict.status}")
+    if outcome.confidence != "high":
+        return AutoMergeDecision(False, f"Claude's confidence is {outcome.confidence}, not high")
+    worst = update.worst
+    if worst == "unknown":
+        return AutoMergeDecision(False, "Dependabot's commit doesn't say the update type")
+    if worst not in allowed:
+        return AutoMergeDecision(False, f"it's a {worst} update (auto-merge allows {', '.join(allowed)})")
+    return AutoMergeDecision(True, f"{worst} update, tests passed on the merge result, high confidence")

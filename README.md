@@ -42,16 +42,35 @@ The PR's merge result is computed against `main` *as it was when the check ran*.
 - **Merge queue (recommended).** Turn on the merge queue for `main`. When a PR enters the queue, GitHub builds the exact commit that will land, and the workflow's `merge_group` trigger re-runs your build and tests on it. Claude isn't called again, so this costs no tokens. The merge queue is available for organization repositories: public ones, and private ones on GitHub Enterprise Cloud.
 - **Require branches to be up to date.** Turn on **Require branches to be up to date before merging**. Dependabot PRs then have to be updated with `main` before merging. Each update triggers a fresh check, including a new Claude review.
 
-## Auto-merge (optional)
+## Auto-merge: hands-off updates (optional)
 
-With `auto-merge: true`, the action turns on GitHub auto-merge when the verdict is **pass**, and turns it off again if a later push doesn't pass. GitHub then merges once every required check is green, through the merge queue if you use one.
+With `auto-merge: true`, updates the gate is confident about merge with no human involved. Everything else waits for review, with the reason written in the PR comment.
 
-It needs:
-- `contents: write` permission;
-- **Allow auto-merge** turned on in the repository settings;
-- branch protection with required checks. Without them there's nothing to wait for, and GitHub refuses to turn auto-merge on.
+**A PR merges automatically only when all of these are true:**
+1. The verdict is **pass**: the build and tests passed on the merge result, Claude rates the risk low, and every affected call site is tested.
+2. Claude's confidence is **high**. The verdict alone accepts medium.
+3. The update type is in `auto-merge-update-types`, which defaults to `patch,minor`. The type comes from the metadata Dependabot writes into its commit message, not from Claude. A grouped PR counts as its largest update. A PR with no metadata, such as one from another bot, is never merged automatically.
 
-Merges made with the default `GITHUB_TOKEN` don't trigger `push` workflows. If you deploy on push to `main`, pass a GitHub App token or a fine-grained PAT as `github-token`.
+The PR comment says which way it went, for example *"Auto-merge: ✋ no, it's a major update"*.
+
+**How the merge happens:**
+- **With branch protection** (the gate is a required check), the gate turns on GitHub auto-merge, and GitHub merges once every required check is green. That includes the merge queue if you use one. If a later push stops qualifying, the gate turns auto-merge off again.
+- **Without branch protection** (for example a private repo on GitHub Free, where required checks aren't available), the gate merges the PR itself, with these safeguards:
+  - It waits for the PR's other checks, such as CI, for up to 20 minutes. It merges only if they all pass.
+  - It merges only the PR head it reviewed. If anything has been pushed since, the next run decides.
+  - If `main` has moved since the tests ran (usually because another update merged first), it re-runs `test-command` on the PR merged into the new `main`. Claude isn't called again, because the PR's diff hasn't changed. If the tests now fail, it doesn't merge, and it explains why on the PR.
+  - When the gate merges directly, it waits only for checks from other workflows, not for other jobs in its own workflow run. Keep the gate in a workflow of its own.
+
+**What it needs:**
+- `contents: write` permission in the workflow.
+- With branch protection: **Allow auto-merge** turned on in the repository settings.
+- If you deploy on push to `main`: merges made with the default `GITHUB_TOKEN` don't trigger `push` workflows. Pass a GitHub App token or a fine-grained PAT as `github-token`.
+
+### Recommended Dependabot settings
+
+[examples/dependabot.yml](examples/dependabot.yml) is set up to work with auto-merge:
+- **Cooldown:** Dependabot waits a few days before proposing a new release. Most malicious or broken releases are caught and pulled within that time, and this matters more once nobody reviews the merge.
+- **Grouping:** minor and patch updates arrive in one PR per ecosystem, and majors arrive one at a time. One PR means one review and one merge. Separate PRs would each have to be re-tested after every merge.
 
 ## Ticket text for Linear or Jira
 
@@ -72,8 +91,9 @@ No tracker credentials are needed, because the action never calls Linear or Jira
 | `test-command` | (empty) | Shell command that builds and tests the PR. **Required for a pass.** |
 | `test-timeout-minutes` | `20` | Timeout for `test-command`. A timeout counts as a failure. |
 | `fail-on` | `fail` | `fail`: the check fails only on a failing verdict, so people can still merge needs-human PRs after reading the review. `needs-human`: anything short of a pass fails. `never`: the check always succeeds. |
-| `auto-merge` | `false` | Turn on auto-merge for passing PRs. |
+| `auto-merge` | `false` | Merge confident updates without a human. See "Auto-merge". |
 | `auto-merge-method` | `squash` | `squash`, `merge` or `rebase`. |
+| `auto-merge-update-types` | `patch,minor` | Update types that may merge automatically: any of `patch`, `minor`, `major`. |
 | `model` | `claude-opus-5-5` | Claude model. |
 | `effort` | `high` | `low`, `medium`, `high`, `xhigh` or `max`. |
 | `max-turns` | `30` | Investigation turns before Claude must give its verdict. |
@@ -84,7 +104,7 @@ No tracker credentials are needed, because the action never calls Linear or Jira
 | `pr-number` | (from the event) | Set this when running from `workflow_dispatch`. |
 | `ticket-on` | `fail` | Which verdicts add ticket text for Linear or Jira to the PR comment: `fail`, `needs-human` or `never`. |
 
-**Outputs:** `verdict` (`pass`, `needs-human` or `fail`), `risk` (`low`, `medium`, `high` or `unknown`), `confidence`, and `skipped`.
+**Outputs:** `verdict` (`pass`, `needs-human` or `fail`), `risk` (`low`, `medium`, `high` or `unknown`), `confidence`, `skipped`, `auto-merge` (whether the PR qualified) and `merged` (whether this run merged it).
 
 ## Security
 

@@ -1,17 +1,29 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
 import sys
 import time
+import urllib.parse
+from collections.abc import Callable
 from pathlib import Path
 
 import anthropic
 
 from .claude_review import ReviewError, ReviewOutcome, run_review
 from .config import Config, ConfigError, should_fail
-from .gate import PASS, Verdict, decide, describe_checkout, pr_number_from_queue_ref
+from .gate import (
+    PASS,
+    Checkout,
+    Verdict,
+    auto_merge_decision,
+    decide,
+    describe_checkout,
+    parse_dependabot_metadata,
+    pr_number_from_queue_ref,
+)
 from .github_api import GitHub, GitHubError
 from .prompts import SYSTEM_PROMPT, CheckRun, build_user_message
 from .repo_tools import RepoTools
@@ -168,7 +180,18 @@ def review_pr(cfg: Config, gh: GitHub, event: dict) -> int:
     run_url = None
     if os.environ.get("GITHUB_RUN_ID"):
         run_url = f"{cfg.server_url}/{cfg.repository}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+    decision = None
+    if cfg.auto_merge:
+        try:
+            update = parse_dependabot_metadata(gh.get_commit_message(head_sha))
+        except GitHubError as e:
+            print(f"::warning::Could not read Dependabot's commit metadata: {e}")
+            update = parse_dependabot_metadata("")  # unknown update type, so no auto-merge
+        decision = auto_merge_decision(verdict, outcome, update, cfg.auto_merge_update_types)
+        print(f"Auto-merge: {'yes' if decision.merge else 'no'}, {decision.reason}")
     body = render_comment(outcome, verdict, RenderContext(cfg.server_url, cfg.repository, cfg.model, checkout, test, run_url))
+    if decision is not None:
+        body += f"\n**Auto-merge:** {'✅ yes' if decision.merge else '✋ no'}, {decision.reason}.\n"
     body += ticket_text(cfg, pr, verdict, outcome, run_url)
     append_summary(body)
 
@@ -187,10 +210,16 @@ def review_pr(cfg: Config, gh: GitHub, event: dict) -> int:
             )
         raise
 
-    if cfg.auto_merge:
-        update_auto_merge(gh, pr, verdict.status == PASS, cfg.auto_merge_method)
+    merged = False
+    if decision is not None:
+        merged = update_auto_merge(
+            gh, pr, decision.merge, cfg.auto_merge_method, checkout,
+            retest=lambda base: retest_on_base(cfg, number, head_sha, base),
+        )
 
     set_output("verdict", verdict.status)
+    set_output("auto-merge", "true" if decision and decision.merge else "false")
+    set_output("merged", "true" if merged else "false")
     set_output("risk", outcome.risk)
     set_output("confidence", outcome.confidence)
 
@@ -217,18 +246,135 @@ def ticket_text(cfg: Config, pr: dict, verdict: Verdict, outcome: ReviewOutcome,
     return render_ticket_section(content)
 
 
-def update_auto_merge(gh: GitHub, pr: dict, passed: bool, method: str) -> None:
+CHECK_WAIT_SECONDS = 20 * 60
+CHECK_POLL_SECONDS = 20
+# How many times a run re-tests on a moved base branch before leaving the PR for a human.
+MAX_RETESTS = 3
+RETEST_MARKER = "<!-- claude-dependabot-reviewer:retest -->"
+
+# Re-runs test-command on the PR merged into a newer base commit; True if it passed.
+Retest = Callable[[str], bool]
+
+
+def update_auto_merge(gh: GitHub, pr: dict, merge: bool, method: str, checkout: Checkout,
+                      retest: Retest | None = None, sleep=time.sleep, clock=time.monotonic) -> bool:
+    """Hand the PR to GitHub auto-merge, or merge it directly where that isn't possible.
+
+    Returns True if this run merged the PR itself.
+    """
+    if not merge:
+        if pr.get("auto_merge"):
+            try:
+                gh.disable_auto_merge(pr["node_id"])
+                print("Auto-merge disabled: this push no longer qualifies.")
+            except GitHubError as e:
+                print(f"::warning::Could not disable auto-merge: {e}")
+        return False
     try:
-        if passed:
-            gh.enable_auto_merge(pr["node_id"], method)
-            print(f"Auto-merge enabled ({method}); GitHub merges once all required checks pass.")
-        elif pr.get("auto_merge"):
-            gh.disable_auto_merge(pr["node_id"])
-            print("Auto-merge disabled: this push no longer passes the gate.")
+        gh.enable_auto_merge(pr["node_id"], method)
+        print(f"Auto-merge enabled ({method}); GitHub merges once all required checks pass.")
+        return False
     except GitHubError as e:
-        # Common causes: auto-merge not allowed in repo settings, no branch protection
-        # (nothing to wait for), or missing contents: write permission.
-        print(f"::warning::Could not change auto-merge: {e}")
+        # Typically "clean status": no required checks to wait for (no branch protection,
+        # e.g. a private repo on GitHub Free), or auto-merge is off in the repo settings.
+        print(f"GitHub auto-merge unavailable ({e}); merging directly once the other checks pass.")
+    return merge_directly(gh, pr, method, checkout, retest, sleep, clock)
+
+
+def merge_directly(gh: GitHub, pr: dict, method: str, checkout: Checkout, retest: Retest | None,
+                   sleep, clock) -> bool:
+    number, head_sha = pr["number"], pr["head"]["sha"]
+    tested_base = checkout.base_sha
+    if not tested_base:
+        print("Not merging: the tests didn't run on the PR's merge result.")
+        return False
+    own_run = os.environ.get("GITHUB_RUN_ID")
+    deadline = clock() + CHECK_WAIT_SECONDS
+    retests = 0
+    try:
+        while True:
+            pending, failed = gh.other_checks(head_sha, own_run)
+            if failed:
+                print(f"::warning::Not merging: other checks failed: {', '.join(failed)}")
+                return False
+            if pending:
+                if clock() >= deadline:
+                    print(f"::warning::Not merging: checks still running after {CHECK_WAIT_SECONDS // 60} min: {', '.join(pending)}")
+                    return False
+                print(f"Waiting for: {', '.join(pending)}")
+                sleep(CHECK_POLL_SECONDS)
+                continue
+
+            # Merge only what was tested: the same PR head on the same base commit.
+            current = gh.get_pr(number)
+            if current["state"] != "open" or current.get("merged"):
+                print("PR is no longer open; nothing to merge.")
+                return False
+            if current["head"]["sha"] != head_sha:
+                print("Not merging: the PR has new commits since this review; the next run decides.")
+                return False
+            new_base = current["base"]["sha"]
+            if new_base != tested_base:
+                # Usually another dependency PR merged first. The PR's diff (what Claude
+                # reviewed) is unchanged, so only the build and tests need re-running.
+                if retest is None or retests >= MAX_RETESTS:
+                    print("::warning::Not merging: the base branch moved since the tests ran.")
+                    return False
+                retests += 1
+                print(f"Base branch moved to {new_base[:7]}; re-testing the PR merged into it ({retests}/{MAX_RETESTS}).")
+                if not retest(new_base):
+                    print(f"::warning::Not merging: tests fail with the PR merged into {new_base[:7]}.")
+                    gh.upsert_comment(number, (
+                        f"{RETEST_MARKER}\n**Not auto-merged:** the review passed, but the tests fail once this PR "
+                        f"is merged with the latest base branch ({new_base[:7]}). This usually means it clashes "
+                        "with another update that merged first. Check the workflow run for the test output."
+                    ), RETEST_MARKER)
+                    return False
+                tested_base = new_base
+                continue
+
+            gh.merge_pr(number, head_sha, method)
+            print(f"Merged PR #{number} ({method}).")
+            return True
+    except GitHubError as e:
+        print(f"::warning::Could not merge: {e}")
+        return False
+
+
+def retest_on_base(cfg: Config, number: int, head_sha: str, base_sha: str) -> bool:
+    """Check out `base_sha`, merge the PR head into it (as GitHub would), and re-run test-command."""
+    host = urllib.parse.urlparse(cfg.server_url).netloc
+    basic = base64.b64encode(f"x-access-token:{cfg.github_token}".encode()).decode()
+    # The checkout keeps no credentials, so pass the token for this fetch only, through
+    # the environment (not argv, not .git/config).
+    auth_env = {
+        **os.environ,
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": f"http.https://{host}/.extraheader",
+        "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {basic}",
+    }
+
+    def git(*args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", *args], cwd=cfg.workspace, capture_output=True, text=True, env=env)
+
+    fetched = git("fetch", "--no-tags", "--quiet", "origin", base_sha, env=auth_env)
+    if fetched.returncode != 0:
+        print(f"::warning::Could not fetch {base_sha[:7]}: {fetched.stderr.strip()[:300]}")
+        return False
+    if git("checkout", "--quiet", "--force", "--detach", base_sha).returncode != 0:
+        print(f"::warning::Could not check out {base_sha[:7]}")
+        return False
+    # A throwaway local merge commit, only for running the tests; it is never pushed, so it
+    # is not signed (a runner's signing setup would otherwise make the merge fail).
+    merged = git("-c", "user.name=dependabot-gate", "-c", "user.email=dependabot-gate@users.noreply.github.com",
+                 "-c", "commit.gpgsign=false", "merge", "--no-ff", "--no-edit", "--quiet", head_sha)
+    if merged.returncode != 0:
+        git("merge", "--abort")
+        print(f"::warning::The PR no longer merges cleanly into {base_sha[:7]}: {(merged.stderr or merged.stdout).strip()[:300]}")
+        return False
+    if not cfg.test_command:
+        return False
+    return run_checks(cfg, cfg.runner_temp / f"dep-review-retest-{number}.log").passed
 
 
 def main() -> int:

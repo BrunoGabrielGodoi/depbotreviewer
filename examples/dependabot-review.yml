@@ -3,10 +3,13 @@
 # Setup:
 #   1. Add ANTHROPIC_API_KEY under Settings > Secrets and variables > Dependabot.
 #      (Dependabot-triggered runs cannot read normal Actions secrets.)
-#   2. Set the toolchain step and test-command below for your project.
-#   3. In branch protection (or a ruleset) for main, require the "dependabot-gate" check, and either
+#   2. Copy examples/dependabot.yml to .github/dependabot.yml (cooldown + grouping for auto-merge).
+#   3. Set the toolchain step and test-command below for your project.
+#   4. In branch protection (or a ruleset) for main, require the "dependabot-gate" check, and either
 #      turn on the merge queue or "Require branches to be up to date before merging".
 #      See the README section "Making sure what you tested is what lands".
+#      (Private repo on GitHub Free? Skip this: with auto-merge on, the gate merges directly and
+#      re-tests against the latest main itself.)
 name: Dependabot gate
 
 on:
@@ -15,7 +18,7 @@ on:
   merge_group: # re-runs the build and tests on the exact commit the merge queue will land
 
 permissions:
-  contents: read # change to `write` if you turn on auto-merge
+  contents: write # needed for auto-merge; use `read` if you leave auto-merge off
   pull-requests: write # post the review comment
   issues: write # create and apply verdict labels
 
@@ -57,5 +60,6 @@ jobs:
           test-command: npm ci && npm test
           # fail-on: fail          # default: the check fails only when the update breaks something
           # fail-on: needs-human   # stricter: anything short of a verified pass fails the check
-          # auto-merge: true       # merge automatically on a pass (needs contents: write)
+          auto-merge: true         # merge confident patch/minor updates without a human
+          # auto-merge-update-types: patch   # stricter: only patch updates merge automatically
           # ticket-on: needs-human # ticket text to paste into Linear/Jira is added for fails; this adds it for needs-human too

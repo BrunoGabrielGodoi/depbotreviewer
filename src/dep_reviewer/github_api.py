@@ -116,6 +116,41 @@ class GitHub:
             {"id": pr_node_id, "method": method.upper()},
         )
 
+    def other_checks(self, sha: str, own_run_id: str | None) -> tuple[list[str], list[str]]:
+        """Checks on `sha` other than this workflow run: (still running, failed) names.
+
+        Covers check runs (GitHub Actions and apps) and legacy commit statuses.
+        """
+        pending: list[str] = []
+        failed: list[str] = []
+        page = 1
+        while True:
+            data = self._request("GET", self._repo(f"/commits/{sha}/check-runs?per_page={PER_PAGE}&page={page}"))
+            runs = data.get("check_runs", [])
+            for run in runs:
+                if own_run_id and f"/actions/runs/{own_run_id}/" in (run.get("details_url") or ""):
+                    continue
+                if run["status"] != "completed":
+                    pending.append(run["name"])
+                elif run.get("conclusion") not in ("success", "neutral", "skipped"):
+                    failed.append(f"{run['name']} ({run.get('conclusion')})")
+            if len(runs) < PER_PAGE:
+                break
+            page += 1
+        for status in self._request("GET", self._repo(f"/commits/{sha}/status")).get("statuses", []):
+            if status["state"] == "pending":
+                pending.append(status["context"])
+            elif status["state"] != "success":
+                failed.append(f"{status['context']} ({status['state']})")
+        return pending, failed
+
+    def get_commit_message(self, sha: str) -> str:
+        return self._request("GET", self._repo(f"/commits/{sha}"))["commit"]["message"]
+
+    def merge_pr(self, number: int, head_sha: str, method: str) -> None:
+        """Merge now. GitHub refuses (409) if the head is no longer `head_sha`."""
+        self._request("PUT", self._repo(f"/pulls/{number}/merge"), {"sha": head_sha, "merge_method": method})
+
     def disable_auto_merge(self, pr_node_id: str) -> None:
         self._graphql_mutation(
             "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }",

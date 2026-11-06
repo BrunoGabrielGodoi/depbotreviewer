@@ -1,0 +1,31 @@
+# Copy to .github/dependabot.yml in the repository you want gated, and change the
+# ecosystems and directories to match it. Set up to work with the gate's auto-merge
+# (see the README section "Auto-merge: hands-off updates").
+version: 2
+updates:
+  - package-ecosystem: npm # or nuget, pip, uv, maven, gradle, gomod, cargo, docker, ...
+    directory: /
+    schedule:
+      interval: weekly
+    # Wait before proposing new releases. Most malicious or broken releases are caught
+    # and pulled within days, and this matters once nobody reviews the merge.
+    cooldown:
+      default-days: 3
+      semver-major-days: 7
+    # Minor and patch updates arrive in one PR: one review, one test run, one merge.
+    # Majors stay as separate PRs, so one breaking change doesn't hold the rest back.
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 10
+
+  # The workflows' own actions.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+    groups:
+      actions:
+        update-types: [minor, patch]

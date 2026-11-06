@@ -64,15 +64,23 @@ inputs:
     default: fail
   auto-merge:
     description: >-
-      Turn on GitHub auto-merge when the verdict is pass, and turn it off when a later
-      push does not pass. Needs `contents: write`, "Allow auto-merge" in the repo
-      settings, and branch protection with required checks.
+      Merge without a human when the verdict is pass, Claude's confidence is high and
+      the update type is in auto-merge-update-types. Uses GitHub auto-merge where branch
+      protection allows it; otherwise waits for the PR's other checks and merges directly
+      if they pass and nothing changed since the tests ran. Needs `contents: write`.
     required: false
     default: "false"
   auto-merge-method:
     description: "squash, merge or rebase."
     required: false
     default: squash
+  auto-merge-update-types:
+    description: >-
+      Update types that may merge without a human, from Dependabot's own metadata:
+      a comma-separated list of patch, minor and major. A grouped PR counts as its
+      largest update.
+    required: false
+    default: patch,minor
   allowed-authors:
     description: >-
       Comma-separated PR authors to review. Other PRs are skipped. Add
@@ -104,6 +112,12 @@ outputs:
   skipped:
     description: "true when the PR was not by an allowed author."
     value: ${{ steps.review.outputs.skipped }}
+  auto-merge:
+    description: "true when the PR qualified for auto-merge."
+    value: ${{ steps.review.outputs.auto-merge }}
+  merged:
+    description: "true when this run merged the PR itself (no branch protection to hand it to)."
+    value: ${{ steps.review.outputs.merged }}
 
 runs:
   using: composite
@@ -140,6 +154,7 @@ runs:
         INPUT_FAIL_ON: ${{ inputs.fail-on }}
         INPUT_AUTO_MERGE: ${{ inputs.auto-merge }}
         INPUT_AUTO_MERGE_METHOD: ${{ inputs.auto-merge-method }}
+        INPUT_AUTO_MERGE_UPDATE_TYPES: ${{ inputs.auto-merge-update-types }}
         INPUT_ALLOWED_AUTHORS: ${{ inputs.allowed-authors }}
         INPUT_PR_NUMBER: ${{ inputs.pr-number }}
         INPUT_TICKET_ON: ${{ inputs.ticket-on }}

@@ -59,6 +59,7 @@ class Config:
     event_name: str
     graphql_url: str
     ticket_on: str = "fail"
+    auto_merge_update_types: tuple[str, ...] = ("patch", "minor")
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] = os.environ) -> Config:
@@ -95,6 +96,12 @@ class Config:
         ticket_on = inp("TICKET_ON", "fail").lower() or "fail"
         if ticket_on not in FAIL_ON:
             raise ConfigError(f"ticket-on must be one of {', '.join(FAIL_ON)}, got {ticket_on!r}")
+        update_types = tuple(
+            t.strip().lower() for t in (inp("AUTO_MERGE_UPDATE_TYPES", "patch,minor") or "patch,minor").split(",") if t.strip()
+        )
+        bad = [t for t in update_types if t not in ("patch", "minor", "major")]
+        if bad or not update_types:
+            raise ConfigError(f"auto-merge-update-types must be a comma-separated list of patch, minor, major; got {bad or '(empty)'}")
 
         event_path = env.get("GITHUB_EVENT_PATH")
         return cls(
@@ -124,6 +131,7 @@ class Config:
             event_name=env.get("GITHUB_EVENT_NAME", ""),
             graphql_url=env.get("GITHUB_GRAPHQL_URL") or f"{api_url}/graphql",
             ticket_on=ticket_on,
+            auto_merge_update_types=update_types,
         )
 
 
