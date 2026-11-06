@@ -1,0 +1,54 @@
+# Runs the gate from this repository (uses: ./) on Dependabot PRs opened against this
+# repository: the testbed bumps (see testbed/README.md) and bumps to the action's own deps.
+# Requires ANTHROPIC_API_KEY as a Dependabot secret in this repository.
+name: Self-test
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to re-review
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  dependabot-gate:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: self-test-${{ github.event.pull_request.number || inputs.pr_number }}
+      cancel-in-progress: true
+    steps:
+      # The PR merged into main: the default on pull_request, set explicitly for manual re-runs.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/pull/{0}/merge', inputs.pr_number) || '' }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: ./
+        id: gate
+        with:
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          test-command: bash scripts/self-test.sh
+          pr-number: ${{ inputs.pr_number }}
+          # This repo checks the gate's judgement, so never fail the job on a verdict.
+          fail-on: never
+
+      - name: Show verdict
+        if: always()
+        run: echo "verdict=${{ steps.gate.outputs.verdict }} risk=${{ steps.gate.outputs.risk }}"

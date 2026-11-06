@@ -1,0 +1,15 @@
+{
+  "name": "depgate-testbed",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Sample app with deliberately old dependencies, so Dependabot opens PRs that exercise the gate.",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "chalk": "4.1.2",
+    "escape-html": "1.0.2",
+    "ms": "2.0.0"
+  }
+}

@@ -1,0 +1,14 @@
+version: 2
+updates:
+  # The testbed: deliberately old dependencies that exercise each verdict (see testbed/README.md).
+  - package-ecosystem: npm
+    directory: /testbed
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # The action's own Python dependencies: the gate reviews bumps to itself.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
