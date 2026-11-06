@@ -13,7 +13,7 @@ on:
         required: true
 
 permissions:
-  contents: read
+  contents: write # auto-merge
   pull-requests: write
   issues: write
 
@@ -50,6 +50,10 @@ jobs:
           fail-on: never
           # Show the ticket text on needs-human PRs (ms) as well as fails (chalk).
           ticket-on: needs-human
+          # Patch updates the gate passes with high confidence merge themselves (escape-html);
+          # minor and major (ms, chalk) always wait for a human here.
+          auto-merge: true
+          auto-merge-update-types: patch
 
       - name: Show verdict
         if: always()
