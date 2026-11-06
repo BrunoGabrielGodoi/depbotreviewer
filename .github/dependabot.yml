@@ -12,3 +12,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+
+  # The workflows' own actions (checkout, setup-node, setup-python).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
