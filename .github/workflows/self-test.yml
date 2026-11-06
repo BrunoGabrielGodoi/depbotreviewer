@@ -27,7 +27,7 @@ jobs:
       cancel-in-progress: true
     steps:
       # The PR merged into main: the default on pull_request, set explicitly for manual re-runs.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/pull/{0}/merge', inputs.pr_number) || '' }}
           fetch-depth: 0
