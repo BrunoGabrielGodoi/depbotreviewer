@@ -53,6 +53,16 @@ It needs:
 
 Merges made with the default `GITHUB_TOKEN` don't trigger `push` workflows. If you deploy on push to `main`, pass a GitHub App token or a fine-grained PAT as `github-token`.
 
+## Ticket text for Linear or Jira
+
+When a PR fails the gate, the PR comment ends with a collapsed **📋 Ticket text** section. It holds a title and a Markdown description, each in its own code block, so GitHub's copy button grabs either one in a click. Paste them into Linear, Jira or any other tracker: both Linear and Jira Cloud turn pasted Markdown into formatted text.
+
+The description has the verdict and its reasons, Claude's summary, the affected code with no test coverage, and links to the PR and the workflow run.
+
+`ticket-on` decides which verdicts get ticket text, with the same values as `fail-on`. The default, `fail`, adds it only when the update breaks something. `needs-human` also adds it to updates that couldn't be verified. `never` turns it off.
+
+No tracker credentials are needed, because the action never calls Linear or Jira.
+
 ## Inputs
 
 | Input | Default | Description |
@@ -72,6 +82,7 @@ Merges made with the default `GITHUB_TOKEN` don't trigger `push` workflows. If y
 | `label-prefix` | `dependabot-review:` | Prefix for verdict labels. |
 | `allowed-authors` | `dependabot[bot]` | Comma-separated PR authors to gate. Add `renovate[bot]` for Renovate. |
 | `pr-number` | (from the event) | Set this when running from `workflow_dispatch`. |
+| `ticket-on` | `fail` | Which verdicts add ticket text for Linear or Jira to the PR comment: `fail`, `needs-human` or `never`. |
 
 **Outputs:** `verdict` (`pass`, `needs-human` or `fail`), `risk` (`low`, `medium`, `high` or `unknown`), `confidence`, and `skipped`.
 

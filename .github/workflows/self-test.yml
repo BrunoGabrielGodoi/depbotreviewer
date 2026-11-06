@@ -48,6 +48,8 @@ jobs:
           pr-number: ${{ inputs.pr_number }}
           # This repo checks the gate's judgement, so never fail the job on a verdict.
           fail-on: never
+          # Show the ticket text on needs-human PRs (ms) as well as fails (chalk).
+          ticket-on: needs-human
 
       - name: Show verdict
         if: always()

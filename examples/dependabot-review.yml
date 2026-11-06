@@ -58,3 +58,4 @@ jobs:
           # fail-on: fail          # default: the check fails only when the update breaks something
           # fail-on: needs-human   # stricter: anything short of a verified pass fails the check
           # auto-merge: true       # merge automatically on a pass (needs contents: write)
+          # ticket-on: needs-human # ticket text to paste into Linear/Jira is added for fails; this adds it for needs-human too

@@ -58,6 +58,7 @@ class Config:
     runner_temp: Path
     event_name: str
     graphql_url: str
+    ticket_on: str = "fail"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] = os.environ) -> Config:
@@ -91,6 +92,10 @@ class Config:
         if not repository:
             raise ConfigError("GITHUB_REPOSITORY is not set; run this inside GitHub Actions")
 
+        ticket_on = inp("TICKET_ON", "fail").lower() or "fail"
+        if ticket_on not in FAIL_ON:
+            raise ConfigError(f"ticket-on must be one of {', '.join(FAIL_ON)}, got {ticket_on!r}")
+
         event_path = env.get("GITHUB_EVENT_PATH")
         return cls(
             anthropic_api_key=api_key,
@@ -118,6 +123,7 @@ class Config:
             runner_temp=Path(env.get("RUNNER_TEMP") or "/tmp"),
             event_name=env.get("GITHUB_EVENT_NAME", ""),
             graphql_url=env.get("GITHUB_GRAPHQL_URL") or f"{api_url}/graphql",
+            ticket_on=ticket_on,
         )
 
 

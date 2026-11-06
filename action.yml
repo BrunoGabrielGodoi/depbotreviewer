@@ -83,6 +83,13 @@ inputs:
     description: PR number. Defaults to the PR in the triggering event (set it for workflow_dispatch).
     required: false
     default: ""
+  ticket-on:
+    description: >-
+      Which verdicts add ready-to-paste ticket text (title and Markdown description for
+      Linear, Jira or any tracker) to the PR comment: `fail` (default), `needs-human`
+      (anything short of a pass) or `never`.
+    required: false
+    default: fail
 
 outputs:
   verdict:
@@ -135,6 +142,7 @@ runs:
         INPUT_AUTO_MERGE_METHOD: ${{ inputs.auto-merge-method }}
         INPUT_ALLOWED_AUTHORS: ${{ inputs.allowed-authors }}
         INPUT_PR_NUMBER: ${{ inputs.pr-number }}
+        INPUT_TICKET_ON: ${{ inputs.ticket-on }}
       # -P stops Python from putting the working directory (the PR's code) on sys.path,
       # so a file in the reviewed repo cannot shadow one of the reviewer's imports.
       run: |

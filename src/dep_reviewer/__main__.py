@@ -11,11 +11,12 @@ import anthropic
 
 from .claude_review import ReviewError, ReviewOutcome, run_review
 from .config import Config, ConfigError, should_fail
-from .gate import PASS, decide, describe_checkout, pr_number_from_queue_ref
+from .gate import PASS, Verdict, decide, describe_checkout, pr_number_from_queue_ref
 from .github_api import GitHub, GitHubError
 from .prompts import SYSTEM_PROMPT, CheckRun, build_user_message
 from .repo_tools import RepoTools
 from .report import COMMENT_MARKER, LABEL_COLORS, LABEL_DESCRIPTIONS, RenderContext, render_comment
+from .tickets import build_content, render_ticket_section
 
 LOG_TAIL_LINES = 150
 
@@ -168,6 +169,7 @@ def review_pr(cfg: Config, gh: GitHub, event: dict) -> int:
     if os.environ.get("GITHUB_RUN_ID"):
         run_url = f"{cfg.server_url}/{cfg.repository}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
     body = render_comment(outcome, verdict, RenderContext(cfg.server_url, cfg.repository, cfg.model, checkout, test, run_url))
+    body += ticket_text(cfg, pr, verdict, outcome, run_url)
     append_summary(body)
 
     try:
@@ -196,6 +198,23 @@ def review_pr(cfg: Config, gh: GitHub, event: dict) -> int:
         print(f"::error::Verdict is {verdict.status} (fail-on: {cfg.fail_on})")
         return 1
     return 0
+
+
+def ticket_text(cfg: Config, pr: dict, verdict: Verdict, outcome: ReviewOutcome, run_url: str | None) -> str:
+    """Ticket title and description to paste into Linear or Jira, when the verdict calls for one."""
+    if not should_fail(verdict.status, cfg.ticket_on):
+        return ""
+    review = outcome.review or {}
+    untested = [
+        f"{i['file']}:{i['line']}: {i['description']}"
+        for i in review.get("impacted_code", [])
+        if i.get("covered_by_tests") != "yes"
+    ]
+    content = build_content(
+        repository=cfg.repository, pr=pr, verdict=verdict.status, reasons=verdict.reasons,
+        summary=review.get("summary"), untested=untested, pr_url=pr["html_url"], run_url=run_url,
+    )
+    return render_ticket_section(content)
 
 
 def update_auto_merge(gh: GitHub, pr: dict, passed: bool, method: str) -> None:
