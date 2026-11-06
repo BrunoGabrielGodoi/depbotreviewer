@@ -1,0 +1,123 @@
+name: Claude Dependabot Reviewer
+description: >-
+  Uses Claude to review a Dependabot pull request: works out what changed upstream,
+  finds where this repository uses the dependency, optionally runs your tests, and
+  posts a risk report with a low / medium / high label.
+author: Agility by Nature
+branding:
+  icon: shield
+  color: orange
+
+inputs:
+  anthropic-api-key:
+    description: >-
+      Anthropic API key. Dependabot-triggered workflows can only read Dependabot secrets,
+      so store it under Settings > Secrets and variables > Dependabot.
+    required: true
+  github-token:
+    description: Token used to read the PR and post the comment and labels.
+    required: false
+    default: ${{ github.token }}
+  model:
+    description: Claude model ID.
+    required: false
+    default: claude-opus-5-5
+  effort:
+    description: "Claude effort level: low, medium, high, xhigh or max."
+    required: false
+    default: high
+  max-turns:
+    description: >-
+      Maximum number of Claude turns (each turn can run several tools) before Claude
+      is told to stop investigating and give its verdict.
+    required: false
+    default: "30"
+  test-command:
+    description: >-
+      Optional shell command that builds and tests the PR (for example `npm ci && npm test`).
+      It runs in the workspace, and Claude reads the result. Leave empty to skip.
+    required: false
+    default: ""
+  test-timeout-minutes:
+    description: Timeout for test-command.
+    required: false
+    default: "20"
+  post-comment:
+    description: Post (or update) the review comment on the PR.
+    required: false
+    default: "true"
+  add-labels:
+    description: Add a risk label to the PR, such as dependabot-risk:low.
+    required: false
+    default: "true"
+  label-prefix:
+    description: Prefix for risk labels.
+    required: false
+    default: "dependabot-risk:"
+  fail-on-risk:
+    description: >-
+      Fail this step when the risk is at or above this level: none, medium or high.
+      Use it to make the review a required check.
+    required: false
+    default: none
+  allowed-authors:
+    description: >-
+      Comma-separated PR authors to review. Other PRs are skipped. Add
+      `renovate[bot]` to review Renovate PRs as well.
+    required: false
+    default: dependabot[bot]
+  pr-number:
+    description: PR number. Defaults to the PR in the triggering event (set it for workflow_dispatch).
+    required: false
+    default: ""
+
+outputs:
+  risk:
+    description: "low, medium, high, or unknown (the review could not be completed)."
+    value: ${{ steps.review.outputs.risk }}
+  confidence:
+    description: "Claude's confidence in the verdict: low, medium or high."
+    value: ${{ steps.review.outputs.confidence }}
+  skipped:
+    description: "true when the PR was not by an allowed author."
+    value: ${{ steps.review.outputs.skipped }}
+
+runs:
+  using: composite
+  steps:
+    # Uses the runner's own python3 instead of actions/setup-python so the action
+    # does not change the Python version seen by later steps in your job.
+    - name: Install reviewer
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 - <<'EOF'
+        import sys
+        if sys.version_info < (3, 11):
+            sys.exit(f"Claude Dependabot Reviewer needs Python 3.11+ on the runner, found {sys.version.split()[0]}")
+        EOF
+        python3 -m venv "$RUNNER_TEMP/dep-reviewer-venv"
+        "$RUNNER_TEMP/dep-reviewer-venv/bin/pip" install --quiet --disable-pip-version-check \
+          -r "$GITHUB_ACTION_PATH/requirements.txt"
+
+    - name: Review with Claude
+      id: review
+      shell: bash
+      env:
+        INPUT_ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_EFFORT: ${{ inputs.effort }}
+        INPUT_MAX_TURNS: ${{ inputs.max-turns }}
+        INPUT_TEST_COMMAND: ${{ inputs.test-command }}
+        INPUT_TEST_TIMEOUT_MINUTES: ${{ inputs.test-timeout-minutes }}
+        INPUT_POST_COMMENT: ${{ inputs.post-comment }}
+        INPUT_ADD_LABELS: ${{ inputs.add-labels }}
+        INPUT_LABEL_PREFIX: ${{ inputs.label-prefix }}
+        INPUT_FAIL_ON_RISK: ${{ inputs.fail-on-risk }}
+        INPUT_ALLOWED_AUTHORS: ${{ inputs.allowed-authors }}
+        INPUT_PR_NUMBER: ${{ inputs.pr-number }}
+      # -P stops Python from putting the working directory (the PR's code) on sys.path,
+      # so a file in the reviewed repo cannot shadow one of the reviewer's imports.
+      run: |
+        PYTHONPATH="$GITHUB_ACTION_PATH/src" "$RUNNER_TEMP/dep-reviewer-venv/bin/python" -P -m dep_reviewer

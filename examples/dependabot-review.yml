@@ -1,0 +1,54 @@
+# Copy to .github/workflows/dependabot-review.yml in the repository you want reviewed.
+#
+# Setup:
+#   1. Add ANTHROPIC_API_KEY under Settings > Secrets and variables > Dependabot.
+#      (Dependabot-triggered runs cannot read normal Actions secrets.)
+#   2. Replace the setup and test-command below with whatever builds and tests your project.
+name: Dependabot review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write # post the review comment
+  issues: write # create and apply risk labels
+
+jobs:
+  review:
+    # Check the PR author, not github.actor: a human re-running the job must still trigger the review.
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: dependabot-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Review the PR's own commit so file links in the comment match.
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # --- Your toolchain. Pick what your project needs. ---
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      # - uses: actions/setup-dotnet@v4
+      #   with: { dotnet-version: 9.0.x }
+      # - uses: actions/setup-python@v5
+      #   with: { python-version: "3.12" }
+
+      - uses: GH-ABN/depbotreviewer@v1
+        with:
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Builds and tests the update so Claude can read the result. Examples:
+          #   npm ci && npm test
+          #   dotnet restore && dotnet build --no-restore && dotnet test --no-build
+          #   pip install -r requirements.txt && pytest
+          test-command: npm ci && npm test
+          # Make the check fail on high risk (useful as a required status check):
+          # fail-on-risk: high
