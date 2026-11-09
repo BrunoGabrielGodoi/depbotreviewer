@@ -151,6 +151,13 @@ def test_refusal_gives_unknown(fake, repo, tmp_path):
     assert out.risk == "unknown" and "declined" in out.unavailable_reason
 
 
+def test_refusal_in_finish_call_gives_unknown(fake, repo, tmp_path):
+    fake.replies(max_turns_hit(), {"type": "result", "subtype": "success", "is_error": False,
+                                   "num_turns": 1, "stop_reason": "refusal", "usage": {}})
+    out = run(fake, repo, tmp_path)
+    assert out.risk == "unknown" and "declined" in out.unavailable_reason
+
+
 def test_error_result_raises(fake, repo, tmp_path):
     fake.replies({"type": "result", "subtype": "error_during_execution", "is_error": True, "num_turns": 1})
     with pytest.raises(ReviewError, match="error_during_execution"):

@@ -138,6 +138,11 @@ def review_from(result: dict[str, Any]) -> dict | None:
     return parse_review(json.dumps(structured))
 
 
+def refused(turns: int, usage: dict[str, int]) -> ReviewOutcome:
+    return ReviewOutcome(review=None, unavailable_reason="Claude declined to review this PR.",
+                         turns=turns, usage=usage)
+
+
 def describe_failure(result: dict[str, Any]) -> str:
     """Why a run gave no verdict, from the result's fixed fields only (never its free text)."""
     status = result.get("api_error_status")
@@ -175,8 +180,7 @@ def run_review_cli(
     turns = int(result.get("num_turns") or 0)
 
     if result.get("stop_reason") == "refusal":
-        return ReviewOutcome(review=None, unavailable_reason="Claude declined to review this PR.",
-                             turns=turns, usage=usage)
+        return refused(turns, usage)
 
     review = review_from(result)
     if review is None and result.get("subtype") == "error_max_turns" and result.get("session_id"):
@@ -184,6 +188,8 @@ def run_review_cli(
         result = run_cli(finish_command(base, result["session_id"]), FINISH_NOW, cwd=work_dir, env=env)
         add_usage(usage, result)
         turns += int(result.get("num_turns") or 0)
+        if result.get("stop_reason") == "refusal":
+            return refused(turns, usage)
         review = review_from(result)
         if review is None:
             raise ReviewError("Claude did not give a verdict after being asked to finish")
