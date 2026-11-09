@@ -3,7 +3,10 @@
 # Copy to .github/workflows/ and set the toolchain steps and test-command.
 #
 # Setup as in dependabot-review.yml, with one difference for branch protection: require
-# the "dependabot-review" check (the review job), which gives the verdict.
+# both checks, "dependabot-test" and "dependabot-review". The review job gives the verdict
+# on pull requests; in a merge queue the test job is the one that re-runs the tests, and
+# the review job does nothing, so requiring only the review check would let the queue
+# merge a commit whose tests failed.
 name: Dependabot gate
 
 on:
@@ -12,7 +15,8 @@ on:
   merge_group:
 
 jobs:
-  # Runs the PR's code. No credentials: not the Claude token, not a GitHub token.
+  # Runs the PR's code. No credentials: not the Claude token, and no GitHub token
+  # outside a merge queue.
   dependabot-test:
     if: github.event_name == 'merge_group' || github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-latest
@@ -39,9 +43,10 @@ jobs:
   # changes, then comments, labels and (optionally) auto-merges.
   dependabot-review:
     needs: dependabot-test
-    # always(): if the test job fails or is cancelled, the review still runs and gives
-    # needs-human, instead of being skipped (a skipped required check counts as passed).
-    if: always() && (github.event_name == 'merge_group' || github.event.pull_request.user.login == 'dependabot[bot]')
+    # !cancelled(): if the test job fails, the review still runs and gives needs-human
+    # instead of being skipped (a skipped required check counts as passed). A test job
+    # cancelled by a newer push doesn't get a review: the newer run reviews the new head.
+    if: ${{ !cancelled() && (github.event_name == 'merge_group' || github.event.pull_request.user.login == 'dependabot[bot]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:

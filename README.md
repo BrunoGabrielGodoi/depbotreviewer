@@ -41,10 +41,10 @@ It works with any ecosystem Dependabot supports (npm, yarn, pnpm, NuGet, pip, Po
 
 `mode` splits the work so they never meet:
 
-- **`mode: test`** runs `test-command` with no credentials (the action refuses `anthropic-api-key` and `claude-code-oauth-token` here, and passes no GitHub token) and uploads the result as an artifact.
+- **`mode: test`** runs `test-command` with no credentials (the action refuses `anthropic-api-key` and `claude-code-oauth-token` here, and passes no GitHub token except in a merge queue, where it looks up the queued PR and runs only code that is about to land) and uploads the result as an artifact.
 - **`mode: review`** runs in a job that `needs` the test job. It gets the credentials, downloads the result and never runs the PR's code. The result was written in a job that ran that code, so it is checked strictly: only the expected fields and types, the same PR head, and the same merge commit. If the base branch moved between the jobs, the two merge commits differ and the verdict is needs-human. A missing or malformed result counts as no tests.
 
-[examples/dependabot-review-two-jobs.yml](examples/dependabot-review-two-jobs.yml) shows the setup. Require the review job's check in branch protection. In a merge queue the test job re-runs the tests and the review job does nothing.
+[examples/dependabot-review-two-jobs.yml](examples/dependabot-review-two-jobs.yml) shows the setup. In branch protection, require both jobs' checks. On pull requests the review job gives the verdict, and the test job fails only when it can't run at all. In a merge queue the test job re-runs the tests and the review job does nothing, so requiring only the review check would let a failing queue commit through.
 
 The default, `mode: all`, keeps everything in one job as before; with an API key it logs a warning. With `claude-code-oauth-token` and a `test-command`, two jobs are required. When a `mode: review` run merges directly (no branch protection) and the base branch has moved since the tests, it doesn't re-test, because that would run the PR's code; it leaves the PR for the next run.
 
