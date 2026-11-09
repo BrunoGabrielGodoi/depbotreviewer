@@ -39,7 +39,7 @@ It works with any ecosystem Dependabot supports (npm, yarn, pnpm, NuGet, pip, Po
 
 Teams on a Claude subscription can run the gate with a Claude Code OAuth token, from `claude setup-token`, instead of an API key. Set `claude-code-oauth-token` and leave `anthropic-api-key` empty; setting both is an error. Store the token as a Dependabot secret, like the key.
 
-The review then runs through the Claude Code CLI (`claude -p`), which the action installs into a private directory at the version in `claude-code-version`. The workflow needs Node and npm, for example from `actions/setup-node`. Everything else is the same: the system prompt, the PR context, the verdict schema and rules, the report and auto-merge. Claude gets the same read-only repository tools, served to Claude Code over MCP, plus Claude Code's own WebSearch and WebFetch.
+The review then runs through the Claude Code CLI (`claude -p`), which the action installs with `npm ci` from its own lockfile (`claude-code/package-lock.json`), into a new directory outside the checkout and with your npm configuration ignored. The workflow needs Node and npm, for example from `actions/setup-node`. Everything else is the same: the system prompt, the PR context, the verdict schema and rules, the report and auto-merge. Claude gets the same read-only repository tools, served to Claude Code over MCP, plus Claude Code's own WebSearch and WebFetch.
 
 Claude Code's WebFetch, unlike the API's `web_fetch`, can fetch any URL Claude writes, including one that carries code in its query string. So WebFetch is allowed only for the hosts in `web-fetch-domains`: by default GitHub, GitLab, Bitbucket and the package registries (npm, PyPI, NuGet, crates.io and docs.rs, Go, RubyGems, Maven Central, Packagist, Hex, Docker Hub). A fetch to any other host is refused and logged. Add the hosts where your dependencies publish release notes if they live elsewhere.
 
@@ -101,7 +101,6 @@ No tracker credentials are needed, because the action never calls Linear or Jira
 | `anthropic-api-key` | (empty) | Anthropic API key. Set this or `claude-code-oauth-token`. |
 | `claude-code-oauth-token` | (empty) | Claude Code OAuth token, used instead of an API key. See "Using a Claude Code OAuth token". |
 | `web-fetch-domains` | (built-in list) | Claude Code engine only: hosts WebFetch may read. See "Using a Claude Code OAuth token". |
-| `claude-code-version` | `2.1.319` | Claude Code CLI version installed when `claude-code-oauth-token` is set. |
 | `github-token` | `github.token` | Token used to read the PR and write the comment, labels and auto-merge. |
 | `test-command` | (empty) | Shell command that builds and tests the PR. **Required for a pass.** |
 | `test-timeout-minutes` | `20` | Timeout for `test-command`. A timeout counts as a failure. |

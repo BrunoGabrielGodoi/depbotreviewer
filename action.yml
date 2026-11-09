@@ -31,12 +31,6 @@ inputs:
       hosts and package registries (see README).
     required: false
     default: ""
-  claude-code-version:
-    description: >-
-      Claude Code CLI version installed when claude-code-oauth-token is set. Installed
-      into a private directory, so it does not change the CLI seen by later steps.
-    required: false
-    default: "2.1.319"
   github-token:
     description: Token used to read the PR and post the comment and labels.
     required: false
@@ -164,17 +158,27 @@ runs:
       id: claude-code
       if: inputs.claude-code-oauth-token != ''
       shell: bash
+      # Installed from the action's own lockfile (claude-code/), which pins the CLI and its
+      # platform packages by integrity hash, into a new directory outside the checkout:
+      # npm reads .npmrc from its working directory, so running it in the reviewed repo
+      # would let that repo pick the registry. User and global npm config are ignored too.
       env:
-        CLAUDE_CODE_VERSION: ${{ inputs.claude-code-version }}
+        npm_config_registry: https://registry.npmjs.org/
       run: |
         set -euo pipefail
         if ! command -v npm >/dev/null; then
           echo "::error::claude-code-oauth-token needs npm on the runner to install Claude Code (add actions/setup-node)."
           exit 1
         fi
-        npm install --prefix "$RUNNER_TEMP/dep-reviewer-claude-code" --no-audit --no-fund --loglevel=error \
-          "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
-        echo "bin=$RUNNER_TEMP/dep-reviewer-claude-code/node_modules/.bin/claude" >> "$GITHUB_OUTPUT"
+        dir="$(mktemp -d "$RUNNER_TEMP/dep-reviewer-claude-code.XXXXXX")"
+        cp "$GITHUB_ACTION_PATH/claude-code/package.json" "$GITHUB_ACTION_PATH/claude-code/package-lock.json" "$dir/"
+        # Empty user and global config files (npm refuses the same file for both).
+        : > "$dir/.user-npmrc"; : > "$dir/.global-npmrc"
+        export npm_config_userconfig="$dir/.user-npmrc" npm_config_globalconfig="$dir/.global-npmrc"
+        cd "$dir"
+        npm ci --no-audit --no-fund --loglevel=error
+        "$dir/node_modules/.bin/claude" --version
+        echo "bin=$dir/node_modules/.bin/claude" >> "$GITHUB_OUTPUT"
 
     - name: Review with Claude
       id: review
