@@ -9,6 +9,9 @@ from pathlib import Path
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 FAIL_ON = ("fail", "needs-human", "never")
 MERGE_METHODS = ("squash", "merge", "rebase")
+# all: one job tests and reviews. test / review: two jobs, so the PR's code and the
+# credentials never share one (see test_result.py).
+MODES = ("all", "test", "review")
 # Where the Claude Code engine's WebFetch may go: source hosts and package registries,
 # where release notes, changelogs and advisories live. Claude Code's WebFetch can fetch
 # any URL Claude writes, unlike the API's web_fetch, which only fetches URLs already in
@@ -75,6 +78,8 @@ class Config:
     claude_code_oauth_token: str = ""
     claude_bin: str = "claude"
     web_fetch_domains: tuple[str, ...] = DEFAULT_WEB_FETCH_DOMAINS
+    mode: str = "all"
+    test_result_dir: Path = Path("/tmp/dep-review-test-result")
 
     @property
     def uses_claude_code(self) -> bool:
@@ -85,19 +90,40 @@ class Config:
         def inp(name: str, default: str = "") -> str:
             return env.get(f"INPUT_{name}", default).strip()
 
+        mode = inp("MODE", "all").lower() or "all"
+        if mode not in MODES:
+            raise ConfigError(f"mode must be one of {', '.join(MODES)}, got {mode!r}")
+        test_command = inp("TEST_COMMAND")
         api_key = inp("ANTHROPIC_API_KEY")
         oauth_token = inp("CLAUDE_CODE_OAUTH_TOKEN")
-        if api_key and oauth_token:
-            raise ConfigError("set either anthropic-api-key or claude-code-oauth-token, not both")
-        if not api_key and not oauth_token:
-            raise ConfigError(
-                "anthropic-api-key and claude-code-oauth-token are both empty. Dependabot-triggered "
-                "runs only see Dependabot secrets: add ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN) "
-                "under Settings > Secrets and variables > Dependabot."
-            )
         token = inp("GITHUB_TOKEN")
-        if not token:
-            raise ConfigError("github-token is empty")
+        if mode == "test":
+            # This job runs the PR's code, which can read any credential this process holds.
+            if api_key or oauth_token:
+                raise ConfigError(
+                    "mode: test runs the PR's code, so it must not receive anthropic-api-key or "
+                    "claude-code-oauth-token; pass them to the mode: review job only"
+                )
+            if not test_command:
+                raise ConfigError("mode: test needs test-command")
+        else:
+            if api_key and oauth_token:
+                raise ConfigError("set either anthropic-api-key or claude-code-oauth-token, not both")
+            if not api_key and not oauth_token:
+                raise ConfigError(
+                    "anthropic-api-key and claude-code-oauth-token are both empty. Dependabot-triggered "
+                    "runs only see Dependabot secrets: add ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN) "
+                    "under Settings > Secrets and variables > Dependabot."
+                )
+            if not token:
+                raise ConfigError("github-token is empty")
+        if mode == "review" and test_command:
+            raise ConfigError("mode: review never runs the PR's code; set test-command on the mode: test job")
+        if mode == "all" and oauth_token and test_command:
+            raise ConfigError(
+                "claude-code-oauth-token can't share a job with test-command: the PR's code could read "
+                "the token from this process. Use two jobs, mode: test and mode: review (see README)."
+            )
 
         effort = inp("EFFORT", "high").lower()
         if effort not in EFFORTS:
@@ -142,7 +168,7 @@ class Config:
             model=inp("MODEL", "claude-opus-5-5") or "claude-opus-5-5",
             effort=effort,
             max_turns=_int(inp("MAX_TURNS", "30") or "30", "max-turns", 1),
-            test_command=inp("TEST_COMMAND"),
+            test_command=test_command,
             test_timeout_minutes=_int(inp("TEST_TIMEOUT_MINUTES", "20") or "20", "test-timeout-minutes", 1),
             post_comment=_bool(inp("POST_COMMENT", "true"), "post-comment"),
             add_labels=_bool(inp("ADD_LABELS", "true"), "add-labels"),
@@ -167,6 +193,8 @@ class Config:
             claude_code_oauth_token=oauth_token,
             claude_bin=env.get("DEP_REVIEWER_CLAUDE_BIN") or "claude",
             web_fetch_domains=domains,
+            mode=mode,
+            test_result_dir=Path(env.get("RUNNER_TEMP") or "/tmp") / "dep-review-test-result",
         )
 
 
