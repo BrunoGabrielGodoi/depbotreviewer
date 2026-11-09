@@ -23,6 +23,14 @@ inputs:
       verdict rules. Store it as a Dependabot secret too. Set this or anthropic-api-key.
     required: false
     default: ""
+  web-fetch-domains:
+    description: >-
+      Claude Code engine only: comma-separated hosts that WebFetch may read, such as
+      github.com. Any other URL is refused, so text planted in a changelog cannot have
+      Claude send your code to another host. Empty uses the built-in list of source
+      hosts and package registries (see README).
+    required: false
+    default: ""
   claude-code-version:
     description: >-
       Claude Code CLI version installed when claude-code-oauth-token is set. Installed
@@ -175,6 +183,7 @@ runs:
         INPUT_ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
         INPUT_CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude-code-oauth-token }}
         DEP_REVIEWER_CLAUDE_BIN: ${{ steps.claude-code.outputs.bin }}
+        INPUT_WEB_FETCH_DOMAINS: ${{ inputs.web-fetch-domains }}
         INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
         INPUT_MODEL: ${{ inputs.model }}
         INPUT_EFFORT: ${{ inputs.effort }}

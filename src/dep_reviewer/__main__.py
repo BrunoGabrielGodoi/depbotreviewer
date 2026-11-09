@@ -159,6 +159,7 @@ def review_pr(cfg: Config, gh: GitHub, event: dict) -> int:
                 user_message=user_message,
                 tools=tools,
                 work_dir=cfg.runner_temp / f"dep-review-claude-code-{number}",
+                web_fetch_domains=cfg.web_fetch_domains,
                 claude_bin=cfg.claude_bin,
             )
         else:

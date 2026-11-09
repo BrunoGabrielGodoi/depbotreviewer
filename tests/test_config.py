@@ -31,3 +31,18 @@ def test_no_credential_rejected():
 def test_empty_bin_falls_back_to_path_lookup():
     cfg = Config.from_env({**BASE, "INPUT_CLAUDE_CODE_OAUTH_TOKEN": "t", "DEP_REVIEWER_CLAUDE_BIN": ""})
     assert cfg.claude_bin == "claude"
+
+
+def test_web_fetch_domains_default_and_override():
+    from dep_reviewer.config import DEFAULT_WEB_FETCH_DOMAINS
+    cfg = Config.from_env({**BASE, "INPUT_CLAUDE_CODE_OAUTH_TOKEN": "t"})
+    assert cfg.web_fetch_domains == DEFAULT_WEB_FETCH_DOMAINS
+    cfg = Config.from_env({**BASE, "INPUT_CLAUDE_CODE_OAUTH_TOKEN": "t",
+                           "INPUT_WEB_FETCH_DOMAINS": "GitHub.com,\n docs.example.org"})
+    assert cfg.web_fetch_domains == ("github.com", "docs.example.org")
+
+
+@pytest.mark.parametrize("bad", ["*", "https://github.com", "github.com/path", "localhost", "a b.com"])
+def test_web_fetch_domains_rejects_non_hosts(bad):
+    with pytest.raises(ConfigError, match="web-fetch-domains"):
+        Config.from_env({**BASE, "INPUT_CLAUDE_CODE_OAUTH_TOKEN": "t", "INPUT_WEB_FETCH_DOMAINS": bad})

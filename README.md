@@ -41,6 +41,8 @@ Teams on a Claude subscription can run the gate with a Claude Code OAuth token, 
 
 The review then runs through the Claude Code CLI (`claude -p`), which the action installs into a private directory at the version in `claude-code-version`. The workflow needs Node and npm, for example from `actions/setup-node`. Everything else is the same: the system prompt, the PR context, the verdict schema and rules, the report and auto-merge. Claude gets the same read-only repository tools, served to Claude Code over MCP, plus Claude Code's own WebSearch and WebFetch.
 
+Claude Code's WebFetch, unlike the API's `web_fetch`, can fetch any URL Claude writes, including one that carries code in its query string. So WebFetch is allowed only for the hosts in `web-fetch-domains`: by default GitHub, GitLab, Bitbucket and the package registries (npm, PyPI, NuGet, crates.io and docs.rs, Go, RubyGems, Maven Central, Packagist, Hex, Docker Hub). A fetch to any other host is refused and logged. Add the hosts where your dependencies publish release notes if they live elsewhere.
+
 Claude Code loads `CLAUDE.md`, settings and hooks from its working directory, and a hook runs a shell command. So the action never starts it in the checkout. It runs in a private directory outside the checkout, with `--restricted`, `--setting-sources ""`, `--strict-mcp-config`, a private config directory and no built-in tools except WebSearch and WebFetch. Its environment holds only the token and basic variables like `PATH` and `HOME`, not the GitHub token.
 
 Usage counts against the subscription that owns the token. Prompt caching and the turn limit work as with the API. The API engine's server-side fallback on refusals isn't available, so a refusal gives `needs-human`.
@@ -98,6 +100,7 @@ No tracker credentials are needed, because the action never calls Linear or Jira
 |---|---|---|
 | `anthropic-api-key` | (empty) | Anthropic API key. Set this or `claude-code-oauth-token`. |
 | `claude-code-oauth-token` | (empty) | Claude Code OAuth token, used instead of an API key. See "Using a Claude Code OAuth token". |
+| `web-fetch-domains` | (built-in list) | Claude Code engine only: hosts WebFetch may read. See "Using a Claude Code OAuth token". |
 | `claude-code-version` | `2.1.319` | Claude Code CLI version installed when `claude-code-oauth-token` is set. |
 | `github-token` | `github.token` | Token used to read the PR and write the comment, labels and auto-merge. |
 | `test-command` | (empty) | Shell command that builds and tests the PR. **Required for a pass.** |

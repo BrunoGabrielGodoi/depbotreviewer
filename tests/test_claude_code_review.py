@@ -71,7 +71,8 @@ def repo(tmp_path):
 def run(fake, repo, tmp_path, max_turns=10):
     return run_review_cli(oauth_token="sk-ant-oat-test", model="m", effort="high", max_turns=max_turns,
                           system="SYSTEM", user_message="USER", tools=repo,
-                          work_dir=tmp_path / "work", claude_bin=str(fake.path), log=lambda *_: None)
+                          work_dir=tmp_path / "work", web_fetch_domains=("github.com", "pypi.org"),
+                          claude_bin=str(fake.path), log=lambda *_: None)
 
 
 def flag(argv, name):
@@ -106,7 +107,9 @@ def test_isolation_flags_and_environment(fake, repo, tmp_path, monkeypatch):
     assert flag(argv, "--setting-sources") == ""
     # Only web tools are built in; the repository tools come from our MCP server.
     assert flag(argv, "--tools") == ",".join(WEB_TOOLS)
-    assert set(flag(argv, "--allowedTools").split(",")) == {*mcp_tool_names(), *WEB_TOOLS}
+    # WebFetch only to the listed domains: a bare "WebFetch" would allow any URL.
+    assert set(flag(argv, "--allowedTools").split(",")) == {
+        *mcp_tool_names(), "WebSearch", "WebFetch(domain:github.com)", "WebFetch(domain:pypi.org)"}
     assert flag(argv, "--max-turns") == "10"
 
     env = call["env"]

@@ -89,12 +89,21 @@ def base_command(claude_bin: str, *, model: str, effort: str, system: str) -> li
     ]
 
 
-def investigate_command(base: list[str], mcp_config: Path, max_turns: int) -> list[str]:
+def allowed_tools(web_fetch_domains: tuple[str, ...]) -> list[str]:
+    """The repository tools, WebSearch, and WebFetch only for the listed domains.
+
+    In print mode a tool call that matches no allow rule is denied, so WebFetch to any
+    other host fails (it shows up in the result's permission_denials)."""
+    return [*mcp_tool_names(), "WebSearch", *(f"WebFetch(domain:{d})" for d in web_fetch_domains)]
+
+
+def investigate_command(base: list[str], mcp_config: Path, max_turns: int,
+                        web_fetch_domains: tuple[str, ...]) -> list[str]:
     return [
         *base,
         "--mcp-config", str(mcp_config),
         "--tools", ",".join(WEB_TOOLS),
-        "--allowedTools", ",".join([*mcp_tool_names(), *WEB_TOOLS]),
+        "--allowedTools", ",".join(allowed_tools(web_fetch_domains)),
         "--max-turns", str(max_turns),
     ]
 
@@ -164,6 +173,7 @@ def run_review_cli(
     user_message: str,
     tools: RepoTools,
     work_dir: Path,
+    web_fetch_domains: tuple[str, ...],
     claude_bin: str = "claude",
     log=print,
 ) -> ReviewOutcome:
@@ -174,8 +184,11 @@ def run_review_cli(
     base = base_command(claude_bin, model=model, effort=effort, system=system)
     usage: dict[str, int] = {}
 
-    result = run_cli(investigate_command(base, write_mcp_config(work_dir, tools), max_turns),
+    result = run_cli(investigate_command(base, write_mcp_config(work_dir, tools), max_turns, web_fetch_domains),
                      user_message, cwd=work_dir, env=env)
+    for denial in result.get("permission_denials") or []:
+        if isinstance(denial, dict):
+            log(f"  denied: {denial.get('tool_name')} (not in the allowed tools or web-fetch-domains)")
     add_usage(usage, result)
     turns = int(result.get("num_turns") or 0)
 

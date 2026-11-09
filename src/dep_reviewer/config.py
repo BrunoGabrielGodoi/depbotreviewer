@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,6 +9,16 @@ from pathlib import Path
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 FAIL_ON = ("fail", "needs-human", "never")
 MERGE_METHODS = ("squash", "merge", "rebase")
+# Where the Claude Code engine's WebFetch may go: source hosts and package registries,
+# where release notes, changelogs and advisories live. Claude Code's WebFetch can fetch
+# any URL Claude writes, unlike the API's web_fetch, which only fetches URLs already in
+# the conversation; without a list, injected text could have it send code to any host.
+DEFAULT_WEB_FETCH_DOMAINS = (
+    "github.com", "raw.githubusercontent.com", "gitlab.com", "bitbucket.org",
+    "registry.npmjs.org", "www.npmjs.com", "pypi.org", "www.nuget.org", "crates.io", "docs.rs",
+    "pkg.go.dev", "rubygems.org", "central.sonatype.com", "packagist.org", "hex.pm", "hub.docker.com",
+)
+DOMAIN_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$")
 
 
 class ConfigError(Exception):
@@ -63,6 +74,7 @@ class Config:
     # Claude Code engine: set instead of anthropic_api_key (see claude_code_review.py).
     claude_code_oauth_token: str = ""
     claude_bin: str = "claude"
+    web_fetch_domains: tuple[str, ...] = DEFAULT_WEB_FETCH_DOMAINS
 
     @property
     def uses_claude_code(self) -> bool:
@@ -114,6 +126,15 @@ class Config:
         if bad or not update_types:
             raise ConfigError(f"auto-merge-update-types must be a comma-separated list of patch, minor, major; got {bad or '(empty)'}")
 
+        raw_domains = inp("WEB_FETCH_DOMAINS")
+        domains = (
+            tuple(d.strip().lower() for d in raw_domains.replace("\n", ",").split(",") if d.strip())
+            if raw_domains else DEFAULT_WEB_FETCH_DOMAINS
+        )
+        bad_domains = [d for d in domains if not DOMAIN_RE.match(d)]
+        if bad_domains:
+            raise ConfigError(f"web-fetch-domains must be host names such as github.com; got {', '.join(bad_domains)}")
+
         event_path = env.get("GITHUB_EVENT_PATH")
         return cls(
             anthropic_api_key=api_key,
@@ -145,6 +166,7 @@ class Config:
             auto_merge_update_types=update_types,
             claude_code_oauth_token=oauth_token,
             claude_bin=env.get("DEP_REVIEWER_CLAUDE_BIN") or "claude",
+            web_fetch_domains=domains,
         )
 
 
