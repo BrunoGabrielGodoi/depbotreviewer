@@ -60,6 +60,13 @@ class Config:
     graphql_url: str
     ticket_on: str = "fail"
     auto_merge_update_types: tuple[str, ...] = ("patch", "minor")
+    # Claude Code engine: set instead of anthropic_api_key (see claude_code_review.py).
+    claude_code_oauth_token: str = ""
+    claude_bin: str = "claude"
+
+    @property
+    def uses_claude_code(self) -> bool:
+        return bool(self.claude_code_oauth_token)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] = os.environ) -> Config:
@@ -67,10 +74,14 @@ class Config:
             return env.get(f"INPUT_{name}", default).strip()
 
         api_key = inp("ANTHROPIC_API_KEY")
-        if not api_key:
+        oauth_token = inp("CLAUDE_CODE_OAUTH_TOKEN")
+        if api_key and oauth_token:
+            raise ConfigError("set either anthropic-api-key or claude-code-oauth-token, not both")
+        if not api_key and not oauth_token:
             raise ConfigError(
-                "anthropic-api-key is empty. Dependabot-triggered runs only see Dependabot "
-                "secrets: add ANTHROPIC_API_KEY under Settings > Secrets and variables > Dependabot."
+                "anthropic-api-key and claude-code-oauth-token are both empty. Dependabot-triggered "
+                "runs only see Dependabot secrets: add ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN) "
+                "under Settings > Secrets and variables > Dependabot."
             )
         token = inp("GITHUB_TOKEN")
         if not token:
@@ -132,6 +143,8 @@ class Config:
             graphql_url=env.get("GITHUB_GRAPHQL_URL") or f"{api_url}/graphql",
             ticket_on=ticket_on,
             auto_merge_update_types=update_types,
+            claude_code_oauth_token=oauth_token,
+            claude_bin=env.get("DEP_REVIEWER_CLAUDE_BIN") or "claude",
         )
 
 

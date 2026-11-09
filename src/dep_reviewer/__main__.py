@@ -13,6 +13,7 @@ from pathlib import Path
 import anthropic
 
 from .claude_review import ReviewError, ReviewOutcome, run_review
+from .claude_code_review import run_review_cli
 from .config import Config, ConfigError, should_fail
 from .gate import (
     PASS,
@@ -146,17 +147,30 @@ def review_pr(cfg: Config, gh: GitHub, event: dict) -> int:
         print("::warning::No test-command set: the verdict can't be a pass without a build and tests.")
     tools.test_log = test_log if test else None
 
-    client = anthropic.Anthropic(api_key=cfg.anthropic_api_key)
+    user_message = build_user_message(pr, files, test, checkout.description)
     try:
-        outcome = run_review(
-            client,
-            model=cfg.model,
-            effort=cfg.effort,
-            max_turns=cfg.max_turns,
-            system=SYSTEM_PROMPT,
-            user_message=build_user_message(pr, files, test, checkout.description),
-            tools=tools,
-        )
+        if cfg.uses_claude_code:
+            outcome = run_review_cli(
+                oauth_token=cfg.claude_code_oauth_token,
+                model=cfg.model,
+                effort=cfg.effort,
+                max_turns=cfg.max_turns,
+                system=SYSTEM_PROMPT,
+                user_message=user_message,
+                tools=tools,
+                work_dir=cfg.runner_temp / f"dep-review-claude-code-{number}",
+                claude_bin=cfg.claude_bin,
+            )
+        else:
+            outcome = run_review(
+                anthropic.Anthropic(api_key=cfg.anthropic_api_key),
+                model=cfg.model,
+                effort=cfg.effort,
+                max_turns=cfg.max_turns,
+                system=SYSTEM_PROMPT,
+                user_message=user_message,
+                tools=tools,
+            )
     except ReviewError as e:
         print(f"::warning::Claude review incomplete: {e}")
         outcome = ReviewOutcome(review=None, unavailable_reason=f"Claude's review could not be completed: {e}")

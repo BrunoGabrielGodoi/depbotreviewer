@@ -35,6 +35,16 @@ It works with any ecosystem Dependabot supports (npm, yarn, pnpm, NuGet, pip, Po
 4. **Make sure what you tested is what lands.** See the next section.
 5. **If `GH-ABN/depbotreviewer` is private:** in its **Settings > Actions > General > Access**, allow repositories in the organization to use it.
 
+## Using a Claude Code OAuth token instead of an API key
+
+Teams on a Claude subscription can run the gate with a Claude Code OAuth token, from `claude setup-token`, instead of an API key. Set `claude-code-oauth-token` and leave `anthropic-api-key` empty; setting both is an error. Store the token as a Dependabot secret, like the key.
+
+The review then runs through the Claude Code CLI (`claude -p`), which the action installs into a private directory at the version in `claude-code-version`. The workflow needs Node and npm, for example from `actions/setup-node`. Everything else is the same: the system prompt, the PR context, the verdict schema and rules, the report and auto-merge. Claude gets the same read-only repository tools, served to Claude Code over MCP, plus Claude Code's own WebSearch and WebFetch.
+
+Claude Code loads `CLAUDE.md`, settings and hooks from its working directory, and a hook runs a shell command. So the action never starts it in the checkout. It runs in a private directory outside the checkout, with `--restricted`, `--setting-sources ""`, `--strict-mcp-config`, a private config directory and no built-in tools except WebSearch and WebFetch. Its environment holds only the token and basic variables like `PATH` and `HOME`, not the GitHub token.
+
+Usage counts against the subscription that owns the token. Prompt caching and the turn limit work as with the API. The API engine's server-side fallback on refusals isn't available, so a refusal gives `needs-human`.
+
 ## Making sure what you tested is what lands
 
 The PR's merge result is computed against `main` *as it was when the check ran*. If other PRs merge afterwards, the tested state is out of date. There are two ways to close that gap:
@@ -86,7 +96,9 @@ No tracker credentials are needed, because the action never calls Linear or Jira
 
 | Input | Default | Description |
 |---|---|---|
-| `anthropic-api-key` | (required) | Anthropic API key. |
+| `anthropic-api-key` | (empty) | Anthropic API key. Set this or `claude-code-oauth-token`. |
+| `claude-code-oauth-token` | (empty) | Claude Code OAuth token, used instead of an API key. See "Using a Claude Code OAuth token". |
+| `claude-code-version` | `2.1.319` | Claude Code CLI version installed when `claude-code-oauth-token` is set. |
 | `github-token` | `github.token` | Token used to read the PR and write the comment, labels and auto-merge. |
 | `test-command` | (empty) | Shell command that builds and tests the PR. **Required for a pass.** |
 | `test-timeout-minutes` | `20` | Timeout for `test-command`. A timeout counts as a failure. |
@@ -134,6 +146,8 @@ python -m pytest -q
 | `src/dep_reviewer/__main__.py` | Orchestration: PR review mode and merge-queue mode |
 | `src/dep_reviewer/gate.py` | Verdict rules and merge-result detection |
 | `src/dep_reviewer/claude_review.py` | Claude agent loop (tool use, turn limit, refusal and pause handling) |
+| `src/dep_reviewer/claude_code_review.py` | The same review through the Claude Code CLI, for OAuth tokens |
+| `src/dep_reviewer/mcp_server.py` | Serves the repository tools to Claude Code over MCP (stdio) |
 | `src/dep_reviewer/repo_tools.py` | Read-only repository tools exposed to Claude |
 | `src/dep_reviewer/prompts.py` | System prompt and PR context message |
 | `src/dep_reviewer/schema.py` | Structured-output schema for Claude's review |

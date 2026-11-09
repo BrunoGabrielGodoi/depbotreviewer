@@ -12,8 +12,23 @@ inputs:
   anthropic-api-key:
     description: >-
       Anthropic API key. Dependabot-triggered workflows can only read Dependabot secrets,
-      so store it under Settings > Secrets and variables > Dependabot.
-    required: true
+      so store it under Settings > Secrets and variables > Dependabot. Set this or
+      claude-code-oauth-token.
+    required: false
+    default: ""
+  claude-code-oauth-token:
+    description: >-
+      Claude Code OAuth token (from `claude setup-token`), used instead of an API key.
+      The review then runs through the Claude Code CLI with the same prompt, tools and
+      verdict rules. Store it as a Dependabot secret too. Set this or anthropic-api-key.
+    required: false
+    default: ""
+  claude-code-version:
+    description: >-
+      Claude Code CLI version installed when claude-code-oauth-token is set. Installed
+      into a private directory, so it does not change the CLI seen by later steps.
+    required: false
+    default: "2.1.319"
   github-token:
     description: Token used to read the PR and post the comment and labels.
     required: false
@@ -137,11 +152,29 @@ runs:
         "$RUNNER_TEMP/dep-reviewer-venv/bin/pip" install --quiet --disable-pip-version-check \
           -r "$GITHUB_ACTION_PATH/requirements.txt"
 
+    - name: Install Claude Code
+      id: claude-code
+      if: inputs.claude-code-oauth-token != ''
+      shell: bash
+      env:
+        CLAUDE_CODE_VERSION: ${{ inputs.claude-code-version }}
+      run: |
+        set -euo pipefail
+        if ! command -v npm >/dev/null; then
+          echo "::error::claude-code-oauth-token needs npm on the runner to install Claude Code (add actions/setup-node)."
+          exit 1
+        fi
+        npm install --prefix "$RUNNER_TEMP/dep-reviewer-claude-code" --no-audit --no-fund --loglevel=error \
+          "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
+        echo "bin=$RUNNER_TEMP/dep-reviewer-claude-code/node_modules/.bin/claude" >> "$GITHUB_OUTPUT"
+
     - name: Review with Claude
       id: review
       shell: bash
       env:
         INPUT_ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        INPUT_CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude-code-oauth-token }}
+        DEP_REVIEWER_CLAUDE_BIN: ${{ steps.claude-code.outputs.bin }}
         INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
         INPUT_MODEL: ${{ inputs.model }}
         INPUT_EFFORT: ${{ inputs.effort }}
