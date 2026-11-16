@@ -151,8 +151,11 @@ class GitHub:
                 failed.append(f"{status['context']} ({status['state']})")
         return pending, failed
 
+    def get_commit(self, sha: str) -> dict:
+        return self._request("GET", self._repo(f"/commits/{sha}"))
+
     def get_commit_message(self, sha: str) -> str:
-        return self._request("GET", self._repo(f"/commits/{sha}"))["commit"]["message"]
+        return self.get_commit(sha)["commit"]["message"]
 
     def merge_pr(self, number: int, head_sha: str, method: str) -> None:
         """Merge now. GitHub refuses (409) if the head is no longer `head_sha`."""

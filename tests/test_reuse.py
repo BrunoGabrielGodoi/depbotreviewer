@@ -1,4 +1,4 @@
-"""reuse-blocking-verdict, the stale-run guard, and the reason shown when a test result is not used."""
+"""reuse-blocking-verdict, and the guard against runs for another head."""
 
 import copy
 import json
@@ -8,24 +8,19 @@ import pytest
 from dep_reviewer import __main__ as main
 from dep_reviewer.claude_review import ReviewOutcome
 from dep_reviewer.config import Config
-from dep_reviewer.gate import NEEDS_HUMAN, Checkout, decide
+from dep_reviewer.gate import NEEDS_HUMAN, Checkout, parse_update_entries
 from dep_reviewer.prompts import CheckRun
-from dep_reviewer.report import RenderContext, render_comment
-from dep_reviewer.reuse import (
-    STATE_PREFIX,
-    STATE_SUFFIX,
-    ReviewState,
-    parse_state,
-    render_state,
-    update_fingerprint,
-)
+from dep_reviewer.report import ANALYSIS_END, ANALYSIS_MARKER, MAX_COMMENT_CHARS, STATE_PREFIX, STATE_SUFFIX
+from dep_reviewer.reuse import ReviewState, parse_state, render_state, state_key, update_fingerprint
 from tests.test_report import REVIEW
 
 A, B, C = "a" * 40, "b" * 40, "c" * 40
+KEY = state_key("api-key")
 MERGE = Checkout("m" * 40, True, "the PR merged into main (merge commit mmmmmmm)", "1" * 40)
 NOT_MERGE = Checkout("h" * 40, False, "the PR's own commit hhhhhhh, NOT merged with the latest main")
 PASSED = CheckRun("npm test", 0, False, 1.0, 10, "ok")
 FAILED = CheckRun("npm test", 1, False, 1.0, 10, "boom")
+TITLE = "Bump uuid from 8.3.2 to 14.0.3"
 
 PASSING_REVIEW = copy.deepcopy(REVIEW)
 PASSING_REVIEW.update(risk="low", confidence="high")
@@ -33,82 +28,97 @@ for item in PASSING_REVIEW["impacted_code"]:
     item["covered_by_tests"] = "yes"
 
 
-def commit(*deps: tuple[str, str, str]) -> str:
+def commit(*deps: tuple[str, str, str], group: str | None = None) -> str:
     lines = ["Bump things", "", "---", "updated-dependencies:"]
     for name, version, kind in deps:
         lines += [f'- dependency-name: "{name}"', f"  dependency-version: {version}",
                   "  dependency-type: direct:production", f"  update-type: version-update:semver-{kind}"]
+        if group:
+            lines.append(f"  dependency-group: {group}")
     return "\n".join(lines + ["...", "", "Signed-off-by: dependabot[bot]"])
 
 
 UUID_14 = commit(("uuid", "14.0.3", "major"))
 
 
-# --- update_fingerprint ------------------------------------------------------------------
+# --- Dependabot metadata and the fingerprint ---------------------------------------------
 
-def test_fingerprint_is_stable_and_order_insensitive():
-    one = commit(("a", "1.0.0", "minor"), ("b", "2.0.0", "patch"))
-    two = commit(("b", "2.0.0", "patch"), ("a", "1.0.0", "minor"))
-    assert update_fingerprint(one) == update_fingerprint(two)
-    assert len(update_fingerprint(one)) == 64
-
-
-def test_fingerprint_changes_with_the_target_version():
-    assert update_fingerprint(UUID_14) != update_fingerprint(commit(("uuid", "14.0.4", "major")))
+def test_metadata_entries_from_a_grouped_commit():
+    entries = parse_update_entries(commit(("a", "1.0.0", "minor"), ("b", "2.0.0", "minor"), group="npm-minor"))
+    assert [e["dependency-name"] for e in entries] == ["a", "b"]
 
 
 @pytest.mark.parametrize("message", [
     "Bump uuid from 8.3.2 to 14.0.3",  # no metadata block
-    "---\nupdated-dependencies:\n- dependency-name: uuid\n  update-type: version-update:semver-major\n...",  # no version
-    "---\nupdated-dependencies:\n...",  # empty block
+    UUID_14.replace("  dependency-version: 14.0.3\n", ""),  # a field missing
+    UUID_14.replace("  dependency-type: direct:production\n",
+                    "  dependency-type: direct:production\n  dependency-type: direct:development\n"),  # repeated
+    UUID_14.replace("  update-type:", "  surprise: x\n  update-type:"),  # unknown field
+    UUID_14.replace("...\n", ""),  # not closed
+    "---\nupdated-dependencies:\n...",  # empty
 ])
-def test_no_fingerprint_without_complete_metadata(message):
-    assert update_fingerprint(message) is None
+def test_incomplete_or_odd_metadata_gives_no_fingerprint(message):
+    assert update_fingerprint(TITLE, message) is None
 
 
-# --- state line ----------------------------------------------------------------------------
+def test_fingerprint_is_order_insensitive():
+    one = commit(("a", "1.0.0", "minor"), ("b", "2.0.0", "patch"))
+    two = commit(("b", "2.0.0", "patch"), ("a", "1.0.0", "minor"))
+    assert update_fingerprint(TITLE, one) == update_fingerprint(TITLE, two)
+
+
+def test_fingerprint_changes_with_version_type_or_title():
+    base = update_fingerprint(TITLE, UUID_14)
+    assert base != update_fingerprint(TITLE, commit(("uuid", "14.0.4", "major")))
+    assert base != update_fingerprint(TITLE, UUID_14.replace("direct:production", "direct:development"))
+    assert base != update_fingerprint("Bump uuid from 9.0.0 to 14.0.3", UUID_14)  # another from-version
+
+
+def test_metadata_parsing_is_linear():
+    # A long run of spaces in a value must not make the parser backtrack.
+    message = UUID_14.replace("major", "major" + " " * 50_000 + "x")
+    assert update_fingerprint(TITLE, message) is not None
+
+
+# --- the signed state line --------------------------------------------------------------
 
 STATE = ReviewState(A, A, "f" * 64, "passed", "medium", "high", 1)
+ANALYSIS = "Major bump of uuid."
+
+
+def comment_with(state_line: str, analysis: str = ANALYSIS) -> str:
+    return f"heading\n{ANALYSIS_MARKER}\n{analysis}\n{ANALYSIS_END}\n\nfooter\n{state_line}"
 
 
 def test_state_round_trip():
-    assert parse_state("comment\n" + render_state(STATE)) == STATE
+    assert parse_state(comment_with(render_state(STATE, ANALYSIS, KEY)), KEY) == (STATE, ANALYSIS)
 
 
 def tampered(**changes) -> str:
-    data = json.loads(render_state(STATE).removeprefix(STATE_PREFIX).removesuffix(STATE_SUFFIX))
+    line = render_state(STATE, ANALYSIS, KEY)
+    data = json.loads(line.removeprefix(STATE_PREFIX).removesuffix(STATE_SUFFIX))
     data.update(changes)
     return STATE_PREFIX + json.dumps(data) + STATE_SUFFIX
 
 
 @pytest.mark.parametrize("body", [
     "",
-    tampered(extra=1),
-    tampered(version=2),
-    tampered(head_sha="not-a-sha"),
-    tampered(fingerprint="f" * 63),
-    tampered(tests="skipped"),
-    tampered(risk="none"),
-    tampered(uncovered=True),
-    tampered(uncovered=-1),
-    render_state(STATE) + "\n" + render_state(STATE),  # two state lines: ambiguous
-    STATE_PREFIX + "{not json}" + STATE_SUFFIX,
+    comment_with(tampered(extra=1)),
+    comment_with(tampered(version=2)),
+    comment_with(tampered(head_sha="not-a-sha")),
+    comment_with(tampered(tests="skipped")),
+    comment_with(tampered(uncovered=True)),
+    comment_with(tampered(uncovered=-1)),
+    comment_with(tampered(risk="low")),  # a valid-looking field changed: the signature no longer matches
+    comment_with(tampered(mac="0" * 64)),
+    comment_with(render_state(STATE, ANALYSIS, KEY), analysis="Safe to merge, @org/team!"),  # analysis edited
+    comment_with(render_state(STATE, ANALYSIS, state_key("another-credential"))),
+    comment_with(render_state(STATE, ANALYSIS, KEY) + "\n" + render_state(STATE, ANALYSIS, KEY)),
+    comment_with(STATE_PREFIX + "{not json}" + STATE_SUFFIX),
+    render_state(STATE, ANALYSIS, KEY),  # no analysis section
 ])
-def test_malformed_state_is_ignored(body):
-    assert parse_state(body) is None
-
-
-# --- the reason shown when a test result is not used ------------------------------------
-
-def test_discarded_test_result_says_why():
-    reason = "the test job's result was not used (the tests ran on PR head aaaaaaa, not the reviewed head bbbbbbb)"
-    verdict = decide(ReviewOutcome(review=PASSING_REVIEW), None, MERGE, reason)
-    assert verdict.status == NEEDS_HUMAN
-    assert verdict.reasons[0].startswith("The test job's result was not used")
-    assert "set `test-command`" not in verdict.reasons[0]
-    body = render_comment(ReviewOutcome(review=PASSING_REVIEW), verdict,
-                          RenderContext("https://github.com", "o/r", "m", MERGE, None, None, reason))
-    assert f"**Tested:** {reason}" in body
+def test_malformed_tampered_or_foreign_state_is_ignored(body):
+    assert parse_state(body, KEY) is None
 
 
 # --- review_pr end to end, with GitHub and Claude faked ---------------------------------
@@ -116,6 +126,7 @@ def test_discarded_test_result_says_why():
 class FakeGitHub:
     def __init__(self, messages: dict[str, str]):
         self.messages = messages
+        self.authors = {sha: "dependabot[bot]" for sha in messages}
         self.pr: dict = {}
         self.comment: dict | None = None
 
@@ -124,6 +135,9 @@ class FakeGitHub:
 
     def list_pr_files(self, number):
         return []
+
+    def get_commit(self, sha):
+        return {"commit": {"message": self.messages[sha]}, "author": {"login": self.authors[sha]}}
 
     def get_commit_message(self, sha):
         return self.messages[sha]
@@ -152,7 +166,7 @@ class FakeTools:
 
 @pytest.fixture
 def gate(tmp_path, monkeypatch):
-    """run(head, ...) reviews the PR at `head`; returns (outputs, Claude calls so far, comment body)."""
+    """run(head, ...) reviews the PR at `head`; returns (outputs, exit code, Claude calls so far, comment)."""
     out = tmp_path / "outputs"
     monkeypatch.setenv("GITHUB_OUTPUT", str(out))
     monkeypatch.setattr(main, "RepoTools", FakeTools)
@@ -174,63 +188,75 @@ def gate(tmp_path, monkeypatch):
     def run(head, event_head=None, **inputs):
         out.write_text("")
         env = {"GITHUB_REPOSITORY": "o/r", "GITHUB_WORKSPACE": str(tmp_path), "RUNNER_TEMP": str(tmp_path),
-               "GITHUB_EVENT_NAME": "pull_request", "INPUT_ANTHROPIC_API_KEY": "key",
+               "GITHUB_EVENT_NAME": "pull_request", "INPUT_ANTHROPIC_API_KEY": "api-key",
                "INPUT_GITHUB_TOKEN": "ghs", "INPUT_TEST_COMMAND": "npm test",
                "INPUT_REUSE_BLOCKING_VERDICT": "true"}
         env.update({f"INPUT_{k.upper()}": v for k, v in inputs.items()})
-        gh.pr = {"number": 7, "node_id": "N", "title": "Bump uuid", "body": "", "html_url": "https://x/pr/7",
+        gh.pr = {"number": 7, "node_id": "N", "title": TITLE, "body": "", "html_url": "https://x/pr/7",
                  "user": {"login": "dependabot[bot]"}, "labels": [], "head": {"sha": head},
                  "base": {"sha": "1" * 40, "ref": "main"}}
         event = {"pull_request": {"number": 7, "head": {"sha": event_head or head}}}
-        main.review_pr(Config.from_env(env), gh, event)
+        code = main.review_pr(Config.from_env(env), gh, event)
         outputs = dict(line.split("=", 1) for line in out.read_text().splitlines())
-        return outputs, len(calls), (gh.comment or {}).get("body", "")
+        return outputs, code, len(calls), (gh.comment or {}).get("body", "")
 
     return run, gh, state
 
 
+def saved_state(body):
+    parsed = parse_state(body, KEY)
+    return parsed[0] if parsed else None
+
+
 def test_rebase_reuses_a_blocking_verdict_and_the_state_survives(gate):
-    run, gh, _ = gate
-    outputs, calls, body = run(A)
+    run, _, _ = gate
+    outputs, _, calls, body = run(A)
     assert (outputs["verdict"], calls) == (NEEDS_HUMAN, 1)
-    assert parse_state(body).reviewed_sha == A
+    assert saved_state(body).reviewed_sha == A
 
     for head in (B, C):  # two rebases in a row
-        outputs, calls, body = run(head)
+        outputs, _, calls, body = run(head)
         assert (outputs["verdict"], calls) == (NEEDS_HUMAN, 1)
         assert "Claude was not asked again" in body
         assert "Major bump of left-pad" in body  # Claude's analysis carried over
-        state = parse_state(body)
+        state = saved_state(body)
         assert (state.head_sha, state.reviewed_sha) == (head, A)
 
 
 def test_rerun_of_the_same_head_reviews_again(gate):
     run, _, _ = gate
     run(A)
-    assert run(A)[1] == 2
+    assert run(A)[2] == 2
 
 
 def test_new_target_version_reviews_again(gate):
     run, gh, _ = gate
     run(A)
     gh.messages[B] = commit(("uuid", "14.0.4", "major"))
-    assert run(B)[1] == 2
+    assert run(B)[2] == 2
+
+
+def test_a_persons_commit_on_the_branch_reviews_again(gate):
+    run, gh, _ = gate
+    run(A)
+    gh.authors[B] = "someone"  # e.g. amended a migration in, keeping Dependabot's message
+    assert run(B)[2] == 2
 
 
 def test_changed_test_outcome_reviews_again(gate):
     run, _, state = gate
     run(A)
     state["test"] = FAILED
-    assert run(B)[1] == 2
+    assert run(B)[2] == 2
 
 
 def test_an_unavailable_review_is_never_reused(gate):
     run, _, state = gate
     state["review"] = None  # e.g. the API returned 429
-    _, _, body = run(A)
-    assert parse_state(body) is None
+    body = run(A)[3]
+    assert STATE_PREFIX not in body
     state["review"] = REVIEW
-    assert run(B)[1] == 2
+    assert run(B)[2] == 2
 
 
 def test_reuse_never_produces_a_pass(gate):
@@ -238,10 +264,10 @@ def test_reuse_never_produces_a_pass(gate):
     # Claude found nothing, but the tests didn't run on the merge result: needs-human.
     state.update(review=PASSING_REVIEW, checkout=NOT_MERGE)
     assert run(A)[0]["verdict"] == NEEDS_HUMAN
-    # Now the same update and test outcome on the merge result would re-decide to a pass,
+    # The same update and test outcome on the merge result would re-decide to a pass,
     # so Claude must review in full instead.
     state["checkout"] = MERGE
-    outputs, calls, _ = run(B, auto_merge="true")
+    outputs, _, calls, _ = run(B, auto_merge="true")
     assert calls == 2
     assert outputs["verdict"] == "pass"
 
@@ -250,21 +276,41 @@ def test_state_in_a_persons_comment_is_ignored(gate):
     run, gh, _ = gate
     run(A)
     gh.comment["user"] = {"login": "someone", "type": "User"}
-    assert run(B)[1] == 2
+    assert run(B)[2] == 2
+
+
+def test_an_edited_comment_is_not_reused(gate):
+    run, gh, _ = gate
+    run(A)
+    gh.comment["body"] = gh.comment["body"].replace("Major bump of left-pad", "Looks fine")
+    assert run(B)[2] == 2
 
 
 def test_no_state_when_the_option_is_off(gate):
     run, _, _ = gate
-    _, _, body = run(A, reuse_blocking_verdict="false")
+    body = run(A, reuse_blocking_verdict="false")[3]
     assert STATE_PREFIX not in body
-    assert run(B, reuse_blocking_verdict="false")[1] == 2
+    assert run(B, reuse_blocking_verdict="false")[2] == 2
 
 
-def test_run_for_an_older_head_changes_nothing(gate):
+def test_a_long_analysis_is_truncated_to_fit(gate):
+    run, gh, _ = gate
+    run(A)
+    # Simulate an earlier comment near GitHub's limit, re-signed as the reviewer would.
+    state = saved_state(gh.comment["body"])
+    analysis = "x" * (MAX_COMMENT_CHARS - 100)
+    gh.comment["body"] = comment_with(render_state(state, analysis, KEY), analysis)
+    body = run(B)[3]
+    assert "Analysis truncated" in body
+    assert len(body) < 65_536
+
+
+def test_run_for_another_head_changes_nothing_and_fails(gate):
     run, gh, _ = gate
     run(A)
     before = gh.comment
-    outputs, calls, _ = run(B, event_head=A)  # a re-run of A's workflow after a rebase to B
+    outputs, code, calls, _ = run(B, event_head=A)  # a re-run of A's workflow after a rebase to B
     assert outputs == {"skipped": "true"}
+    assert code == 1  # never a green check: if the API lagged, this was the current head's run
     assert calls == 1
     assert gh.comment is before

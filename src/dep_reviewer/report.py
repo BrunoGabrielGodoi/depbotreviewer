@@ -9,12 +9,20 @@ from dataclasses import dataclass
 from .claude_review import ReviewOutcome
 from .gate import FAIL, NEEDS_HUMAN, NO_TESTS, PASS, Checkout, Verdict
 from .prompts import CheckRun
-from .reuse import ANALYSIS_END, ANALYSIS_MARKER
 
-COMMENT_MARKER = "<!-- claude-dependabot-reviewer -->"
+MARKER_PREFIX = "<!-- claude-dependabot-reviewer"
+COMMENT_MARKER = f"{MARKER_PREFIX} -->"
+# Claude's analysis sits between these, so a run that reuses the verdict can carry it over
+# (see reuse.py); the state line for that run is the last line of the comment.
+ANALYSIS_MARKER = f"{MARKER_PREFIX}:analysis -->"
+ANALYSIS_END = f"{MARKER_PREFIX}:analysis-end -->"
+STATE_PREFIX = f"{MARKER_PREFIX}:state "
+STATE_SUFFIX = " -->"
 # GitHub rejects comments over 65,536 characters.
 MAX_COMMENT_CHARS = 60_000
 MAX_ROWS = 40
+# Room kept in a reused comment for the auto-merge line, ticket text and state line.
+REUSED_HEADROOM = 10_000
 
 VERDICT_HEADING = {
     PASS: "✅ Verified: safe to merge",
@@ -66,22 +74,25 @@ def _safe_url(url: str) -> str:
     return url if re.match(r"^https?://[^\s)]+$", url) else ""
 
 
+def _tested(ctx: RenderContext) -> str:
+    if ctx.test is not None:
+        return f"`{ctx.test.command}` {ctx.test.describe()}"
+    return ctx.no_test_reason or NO_TESTS
+
+
 def render_comment(outcome: ReviewOutcome, verdict: Verdict, ctx: RenderContext, max_rows: int = MAX_ROWS) -> str:
     out: list[str] = [COMMENT_MARKER, f"## {VERDICT_HEADING[verdict.status]}", ""]
     out += [f"- {neutralize(r)}" for r in verdict.reasons]
     out.append("")
 
-    tested = ctx.no_test_reason or NO_TESTS
-    if ctx.test is not None:
-        tested = f"`{ctx.test.command}` {ctx.test.describe()}"
-    out += [f"**Tested:** {tested}, on {ctx.checkout.description}.  ", f"**Claude risk rating:** {RISK[outcome.risk]}"]
+    out += [f"**Tested:** {_tested(ctx)}, on {ctx.checkout.description}.  ",
+            f"**Claude risk rating:** {RISK[outcome.risk]}"]
     r = outcome.review
     if r is not None:
         out[-1] += f" (confidence: {r['confidence']})"
     out.append("")
 
     if r is not None:
-        # A later run that reuses this verdict carries the analysis over (see reuse.py).
         out += [ANALYSIS_MARKER, neutralize(r["summary"]).strip(), ""]
 
         if r["dependencies"]:
@@ -144,31 +155,29 @@ def render_reused_comment(verdict: Verdict, ctx: RenderContext, risk: str, confi
                           reviewed_sha: str, analysis: str) -> str:
     """The comment for a run that reused an earlier blocking verdict (see reuse.py).
 
-    `analysis` is the analysis section of this reviewer's own earlier comment, carried over
-    unchanged; the heading, reasons and test line describe this run.
+    `analysis` is the signed analysis section of the earlier comment, carried over; the
+    heading, reasons and test line describe this run.
     """
-    tested = ctx.no_test_reason or NO_TESTS
-    if ctx.test is not None:
-        tested = f"`{ctx.test.command}` {ctx.test.describe()}"
     out: list[str] = [COMMENT_MARKER, f"## {VERDICT_HEADING[verdict.status]}", ""]
     out += [f"- {neutralize(r)}" for r in verdict.reasons]
     out += [
         "",
-        f"**Tested:** {tested}, on {ctx.checkout.description}.  ",
+        f"**Tested:** {_tested(ctx)}, on {ctx.checkout.description}.  ",
         f"**Claude risk rating:** {RISK[risk]} (confidence: {confidence}), from the review of `{reviewed_sha[:7]}`",
         "",
         "> Dependabot rebased this PR without changing the update, and the tests had the same outcome, "
         f"so Claude was not asked again. The analysis below is from the review of `{reviewed_sha[:7]}`. "
-        "Delete this comment, or re-run the job, to force a full review.",
-        "",
-        ANALYSIS_MARKER,
-        analysis,
-        ANALYSIS_END,
+        "To force a full review, re-run the job.",
         "",
     ]
     footer = "<sub>Verdict re-decided with this run's tests"
     if ctx.run_url:
         footer += f" · [workflow run]({ctx.run_url})"
     footer += ". A pass is never reused: it always comes from a full review.</sub>"
-    out.append(footer)
+    # Leave room for the auto-merge line, ticket text and state line added after this.
+    room = MAX_COMMENT_CHARS - len("\n".join(out)) - len(footer) - REUSED_HEADROOM
+    carried = neutralize(analysis)
+    if len(carried) > room:
+        carried = carried[:max(room, 0)].rstrip() + "\n\n_Analysis truncated; see the earlier workflow run._"
+    out += [ANALYSIS_MARKER, carried, ANALYSIS_END, "", footer]
     return "\n".join(out)

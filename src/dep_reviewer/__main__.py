@@ -8,7 +8,7 @@ import sys
 import time
 import urllib.parse
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import anthropic
@@ -44,6 +44,7 @@ from .reuse import (
     render_state,
     reusable_outcome,
     state_from_review,
+    state_key,
     update_fingerprint,
 )
 from .test_result import LOG_FILE, TestResultError, checkout_for_review, load_test_result, write_test_result
@@ -172,16 +173,18 @@ def review_pr(cfg: Config, gh: GitHub, event: dict) -> int:
         return 0
 
     head_sha, base_sha, base_ref = pr["head"]["sha"], pr["base"]["sha"], pr["base"]["ref"]
-    # A run for an older head (typically a re-run after Dependabot rebased) must not
-    # overwrite the comment, label or auto-merge state the run for the current head set.
+    # A run for another head (typically a re-run after Dependabot rebased) must not overwrite
+    # the comment, label or auto-merge state of the run for the current head. It fails
+    # instead of passing: a red check on an obsolete head is harmless, but if the API is
+    # what lags, this is the current head's run, and a green skip would let it merge.
     event_head = ((event.get("pull_request") or {}).get("head") or {}).get("sha")
     if event_head and event_head != head_sha:
         print(
-            f"PR #{number} moved from {event_head[:7]} to {head_sha[:7]} since this run was triggered; "
-            "the run for the current head decides. Skipping."
+            f"::error::This run is for {event_head[:7]}, but PR #{number} is at {head_sha[:7]}. "
+            "Nothing was reviewed or changed; the run for the PR's current head decides."
         )
         set_output("skipped", "true")
-        return 0
+        return 1
     set_output("skipped", "false")
     files = gh.list_pr_files(number)
     print(f"Reviewing PR #{number}: {pr['title']} ({len(files)} files changed)")
@@ -222,13 +225,15 @@ def review_pr(cfg: Config, gh: GitHub, event: dict) -> int:
             print("::warning::No test-command set: the verdict can't be a pass without a build and tests.")
         tools.test_log = test_log if test else None
 
-    fingerprint, prior, prior_body = None, None, ""
-    if cfg.reuse_blocking_verdict and cfg.post_comment:
-        fingerprint, prior, prior_body = load_prior_review(gh, number, head_sha)
-    reused = reuse_verdict(prior, prior_body, head_sha, fingerprint, test, checkout, no_test_reason)
+    key = state_key(cfg.claude_code_oauth_token or cfg.anthropic_api_key)
+    prior = PriorReview(None, None, "")
+    if cfg.reuse_blocking_verdict and cfg.post_comment and key:
+        prior = load_prior_review(gh, cfg, pr, key)
+    reused = reuse_verdict(prior, head_sha, test, checkout, no_test_reason)
     if reused is not None:
-        outcome, verdict, analysis = reused
-        print(f"Reusing the blocking verdict from the review of {prior.reviewed_sha[:7]}: same update, same test outcome.")
+        outcome, verdict = reused.outcome, reused.verdict
+        print(f"Reusing the blocking verdict from the review of {reused.state.reviewed_sha[:7]}: "
+              "same update, same test outcome.")
     else:
         outcome = review_with_claude(cfg, number, pr, files, test, checkout, tools, no_test_reason)
         verdict = decide(outcome, test, checkout, no_test_reason)
@@ -258,20 +263,23 @@ def review_pr(cfg: Config, gh: GitHub, event: dict) -> int:
         print(f"Auto-merge: {'yes' if decision.merge else 'no'}, {decision.reason}")
     ctx = RenderContext(cfg.server_url, cfg.repository, cfg.model, checkout, test, run_url, no_test_reason)
     if reused is not None:
-        body = render_reused_comment(verdict, ctx, outcome.risk, outcome.confidence, prior.reviewed_sha, analysis)
-        state: ReviewState | None = replace(prior, head_sha=head_sha)
+        body = render_reused_comment(verdict, ctx, outcome.risk, outcome.confidence,
+                                     reused.state.reviewed_sha, reused.analysis)
+        state: ReviewState | None = replace(reused.state, head_sha=head_sha)
         # The reused outcome holds only the gate inputs, not Claude's call-site details.
         ticket_outcome = ReviewOutcome(review=None)
     else:
         body = render_comment(outcome, verdict, ctx)
-        state = state_from_review(head_sha, fingerprint, test, outcome)
+        state = state_from_review(head_sha, prior.fingerprint, test, outcome)
         ticket_outcome = outcome
     if decision is not None:
         body += f"\n**Auto-merge:** {'✅ yes' if decision.merge else '✋ no'}, {decision.reason}.\n"
     body += ticket_text(cfg, pr, verdict, ticket_outcome, run_url)
     append_summary(body)
-    if cfg.reuse_blocking_verdict and state is not None:
-        body += "\n" + render_state(state)
+    # The state is for the next run, so it stays out of the job summary.
+    analysis = extract_analysis(body)
+    if cfg.reuse_blocking_verdict and key and state is not None and analysis is not None:
+        body += "\n" + render_state(state, analysis, key)
 
     try:
         if cfg.post_comment:
@@ -344,37 +352,57 @@ def review_with_claude(cfg: Config, number: int, pr: dict, files: list[dict], te
         return ReviewOutcome(review=None, unavailable_reason=f"The Claude API returned an error: {type(e).__name__}.")
 
 
-def load_prior_review(gh: GitHub, number: int, head_sha: str) -> tuple[str | None, ReviewState | None, str]:
-    """This head's update fingerprint, and the state and body of the reviewer's earlier comment.
+@dataclass(frozen=True)
+class PriorReview:
+    fingerprint: str | None  # of this run's head; None when nothing may be reused
+    state: ReviewState | None  # saved by the run that wrote the reviewer's comment
+    analysis: str  # the analysis section that state vouches for
 
-    The state is read only from a comment written by a bot account: anyone can post a
-    comment containing the marker, and a person's comment is never trusted or re-posted.
+
+@dataclass(frozen=True)
+class ReusedVerdict:
+    outcome: ReviewOutcome  # the earlier review's gate inputs only
+    verdict: Verdict  # re-decided with this run's tests and checkout
+    state: ReviewState
+    analysis: str
+
+
+def load_prior_review(gh: GitHub, cfg: Config, pr: dict, key: bytes) -> PriorReview:
+    """This head's update fingerprint, and the verified state of the reviewer's comment.
+
+    The fingerprint is only taken from a head commit the PR's author (Dependabot) made, so
+    a person's commit on the branch, even one keeping Dependabot's message, gets a full
+    review. The state is only read from a comment written by a bot account, and
+    parse_state also checks its signature.
     """
     try:
-        fingerprint = update_fingerprint(gh.get_commit_message(head_sha))
-        comment = gh.find_comment(number, COMMENT_MARKER)
+        commit = gh.get_commit(pr["head"]["sha"])
+        comment = gh.find_comment(pr["number"], COMMENT_MARKER)
     except GitHubError as e:
         print(f"::warning::Could not read the earlier review, so it is not reused: {e}")
-        return None, None, ""
+        return PriorReview(None, None, "")
+    author = ((commit.get("author") or {}).get("login") or "").lower()
+    fingerprint = None
+    if author in cfg.allowed_authors:
+        fingerprint = update_fingerprint(pr.get("title") or "", commit["commit"]["message"])
     if comment is None or (comment.get("user") or {}).get("type") != "Bot":
-        return fingerprint, None, ""
-    body = comment.get("body") or ""
-    return fingerprint, parse_state(body), body
+        return PriorReview(fingerprint, None, "")
+    parsed = parse_state(comment.get("body") or "", key)
+    if parsed is None:
+        return PriorReview(fingerprint, None, "")
+    return PriorReview(fingerprint, *parsed)
 
 
-def reuse_verdict(prior: ReviewState | None, prior_body: str, head_sha: str, fingerprint: str | None,
-                  test: CheckRun | None, checkout: Checkout,
-                  no_test_reason: str | None) -> tuple[ReviewOutcome, Verdict, str] | None:
-    """The earlier review's outcome, the verdict re-decided with it, and its analysis text,
-    when this run may skip Claude. None means: do a full review."""
-    outcome = reusable_outcome(prior, head_sha, fingerprint, test)
-    analysis = extract_analysis(prior_body) if outcome is not None else None
-    if outcome is None or analysis is None:
+def reuse_verdict(prior: PriorReview, head_sha: str, test: CheckRun | None, checkout: Checkout,
+                  no_test_reason: str | None) -> ReusedVerdict | None:
+    """The earlier verdict, re-decided, when this run may skip Claude. None means: review in full."""
+    outcome = reusable_outcome(prior.state, head_sha, prior.fingerprint, test)
+    if outcome is None:
         return None
     verdict = decide(outcome, test, checkout, no_test_reason)
     if verdict.status == PASS:
         return None  # a pass can turn on auto-merge, so it always comes from a full review
-    return outcome, verdict, analysis
+    return ReusedVerdict(outcome, verdict, prior.state, prior.analysis)
 
 
 def ticket_text(cfg: Config, pr: dict, verdict: Verdict, outcome: ReviewOutcome, run_url: str | None) -> str:

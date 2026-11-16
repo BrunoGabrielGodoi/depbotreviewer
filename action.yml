@@ -123,11 +123,11 @@ inputs:
     default: ""
   reuse-blocking-verdict:
     description: >-
-      Skip Claude when Dependabot only rebased the PR: same dependencies, versions and
-      update types, same build and test outcome, and the earlier review blocked it (fail
-      or needs-human). The verdict is re-decided with this run's tests; a pass is never
-      reused. Delete the reviewer's comment or re-run the job to force a full review.
-      Needs a bot account's token (the default GITHUB_TOKEN).
+      Skip Claude when Dependabot only rebased a PR that the last review blocked: same
+      update, same build and test outcome. The verdict is re-decided with this run's tests,
+      and a pass is never reused. Re-run the job to force a full review. Needs
+      post-comment, a bot account's github-token (the default GITHUB_TOKEN) and the Claude
+      credential, which signs the saved state.
     required: false
     default: "false"
   ticket-on:

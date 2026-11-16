@@ -7,6 +7,7 @@ from dep_reviewer.claude_review import ReviewOutcome
 from dep_reviewer.config import should_fail
 from dep_reviewer.gate import FAIL, NEEDS_HUMAN, PASS, Checkout, decide, describe_checkout, pr_number_from_queue_ref
 from dep_reviewer.prompts import CheckRun
+from dep_reviewer.report import RenderContext, render_comment
 from tests.test_report import REVIEW
 
 MERGE = Checkout("m" * 40, True, "merge result")
@@ -115,3 +116,13 @@ def test_describe_checkout_detects_merge_result(tmp_path: Path):
     c = describe_checkout(tmp_path, head, "main")
     assert c.is_merge_result is True
     assert "merged into main" in c.description
+
+
+def test_discarded_test_result_says_why():
+    reason = "the test job's result was not used (the tests ran on PR head aaaaaaa, not the reviewed head bbbbbbb)"
+    verdict = decide(outcome(**CLEAN), None, MERGE, reason)
+    assert verdict.status == NEEDS_HUMAN
+    assert verdict.reasons[0].startswith("The test job's result was not used")
+    assert "set `test-command`" not in verdict.reasons[0]
+    body = render_comment(outcome(**CLEAN), verdict, RenderContext("https://github.com", "o/r", "m", MERGE, None, None, reason))
+    assert f"**Tested:** {reason}" in body

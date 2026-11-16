@@ -7,83 +7,76 @@ question again.
 
 With the option on, a run skips Claude when all of these hold:
 
-- the PR's head moved (a re-run of the same head always gets a full review);
-- Dependabot's commit metadata lists the same dependencies, versions and update types;
+- this is not a re-run for the head the last run already handled;
+- the head commit is the PR author's (Dependabot's) and has the same PR title and the
+  same dependencies, target versions, dependency types and update types;
 - the build and tests had the same outcome;
-- the earlier review completed (an API error or limit is never reused);
+- the last review completed (an API error or limit is never saved, so never reused);
 - re-deciding with the earlier review's risk, confidence and untested call sites, and
   this run's tests and checkout, gives fail or needs-human.
 
 A pass is never reused: it can turn on auto-merge, so it always comes from a full review.
-That also bounds what a tampered state can do: it can only block or escalate a PR.
 
-The state lives in a hidden line of the reviewer's own PR comment, and is read only from
-a comment written by a bot account. Deleting the comment, or re-running the job on the
-same head, forces a full review.
+The state is the last line of the reviewer's comment. It is read only from a comment
+written by a bot account, and only if its HMAC verifies: the key is derived from the
+Claude credential, so neither another bot nor a person editing the comment can forge
+the state or the analysis it vouches for. Even a forged state could only keep a PR
+blocked. Re-running the job for the same head, or deleting the comment, forces a full
+review; so does rotating the credential.
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
 from dataclasses import asdict, dataclass
 
 from .claude_review import ReviewOutcome
+from .gate import parse_update_entries
 from .prompts import CheckRun
+from .report import ANALYSIS_END, ANALYSIS_MARKER, STATE_PREFIX, STATE_SUFFIX
+from .test_result import SHA_RE
 
-STATE_PREFIX = "<!-- claude-dependabot-reviewer:state "
-STATE_SUFFIX = " -->"
-# Marks where Claude's analysis starts in the comment, so a reuse run can carry it over.
-ANALYSIS_MARKER = "<!-- claude-dependabot-reviewer:analysis -->"
-ANALYSIS_END = "<!-- claude-dependabot-reviewer:analysis-end -->"
 VERSION = 1
 MAX_STATE_CHARS = 1024
+# Only the count matters to the gate; capped so the state line stays small.
 MAX_UNCOVERED = 1000
-
-_SHA = re.compile(r"^[0-9a-f]{40}$")
-_FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
-_STATE_LINE = re.compile(re.escape(STATE_PREFIX) + r"(\{[^\n]*\})" + re.escape(STATE_SUFFIX))
-TEST_STATUSES = ("passed", "failed", "timed-out", "none")
+TESTS_OUTCOMES = ("passed", "failed", "timed-out", "none")
 RISKS = ("low", "medium", "high")
 CONFIDENCES = ("low", "medium", "high")
 
-# Dependabot's metadata block in its commit message:
-#   ---
-#   updated-dependencies:
-#   - dependency-name: "@scope/pkg"
-#     dependency-version: 2.0.0
-#     dependency-type: direct:production
-#     update-type: version-update:semver-major
-#   ...
-_BLOCK = re.compile(r"^updated-dependencies:\s*$(.*?)^\.\.\.\s*$", re.M | re.S)
-_ENTRY_FIELD = re.compile(r"^\s*-?\s*(dependency-name|dependency-version|update-type):\s*(.+?)\s*$")
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_STATE_LINE = re.compile(re.escape(STATE_PREFIX) + r"(\{[^\n]*\})" + re.escape(STATE_SUFFIX))
+_KEY_CONTEXT = b"claude-dependabot-reviewer reuse-blocking-verdict state v1"
 
 
-def update_fingerprint(commit_message: str) -> str | None:
-    """A hash of the dependencies, target versions and update types the commit says it updates.
+def state_key(credential: str) -> bytes | None:
+    """The HMAC key for the state, derived from the Claude credential; None without one."""
+    if not credential:
+        return None
+    return hmac.new(credential.encode(), _KEY_CONTEXT, hashlib.sha256).digest()
 
-    None when the commit has no metadata block, or an entry lacks a name, version or type:
-    then nothing proves two heads propose the same update, so nothing is reused.
+
+def update_fingerprint(pr_title: str, commit_message: str) -> str | None:
+    """A hash of what the PR proposes: its title and every dependency's name, target version,
+    dependency type and update type, from Dependabot's commit metadata.
+
+    The title carries the from-version and the directory. None when the metadata is
+    missing or incomplete: then nothing proves two heads propose the same update.
     """
-    m = _BLOCK.search(commit_message or "")
-    if not m:
+    entries = parse_update_entries(commit_message)
+    if entries is None:
         return None
-    entries: list[dict[str, str]] = []
-    for line in m.group(1).splitlines():
-        if line.lstrip().startswith("- "):
-            entries.append({})
-        field = _ENTRY_FIELD.match(line)
-        if field and entries:
-            entries[-1][field.group(1)] = field.group(2).strip("'\"")
-    keys = ("dependency-name", "dependency-version", "update-type")
-    if not entries or any(not all(e.get(k) for k in keys) for e in entries):
-        return None
-    canonical = sorted(tuple(e[k] for k in keys) for e in entries)
+    canonical = [pr_title, sorted(
+        (e["dependency-name"], e["dependency-version"], e["dependency-type"], e["update-type"]) for e in entries
+    )]
     return hashlib.sha256(json.dumps(canonical).encode()).hexdigest()
 
 
-def test_status(test: CheckRun | None) -> str:
+def tests_outcome(test: CheckRun | None) -> str:
+    """The build and test result in one word, as saved in the state."""
     if test is None:
         return "none"
     if test.timed_out:
@@ -109,39 +102,61 @@ def state_from_review(head_sha: str, fingerprint: str | None, test: CheckRun | N
     if r is None or fingerprint is None:
         return None
     uncovered = sum(1 for i in r["impacted_code"] if i["covered_by_tests"] != "yes")
-    return ReviewState(head_sha, head_sha, fingerprint, test_status(test), r["risk"], r["confidence"],
+    return ReviewState(head_sha, head_sha, fingerprint, tests_outcome(test), r["risk"], r["confidence"],
                        min(uncovered, MAX_UNCOVERED))
 
 
-def render_state(state: ReviewState) -> str:
-    return STATE_PREFIX + json.dumps({"version": VERSION, **asdict(state)}, separators=(",", ":")) + STATE_SUFFIX
+def _mac(key: bytes, state: ReviewState, analysis: str) -> str:
+    payload = json.dumps([asdict(state), analysis], sort_keys=True).encode()
+    return hmac.new(key, payload, hashlib.sha256).hexdigest()
 
 
-def parse_state(body: str) -> ReviewState | None:
-    """The state saved in a comment body, or None if it is missing or not exactly well-formed."""
+def render_state(state: ReviewState, analysis: str, key: bytes) -> str:
+    """The state line, signed together with the analysis section it was saved with."""
+    data = {"version": VERSION, **asdict(state), "mac": _mac(key, state, analysis)}
+    return STATE_PREFIX + json.dumps(data, separators=(",", ":")) + STATE_SUFFIX
+
+
+def extract_analysis(body: str) -> str | None:
+    """The analysis section of a reviewer comment, without the markers."""
+    start = body.find(ANALYSIS_MARKER)
+    end = body.find(ANALYSIS_END)
+    if start < 0 or end < start:
+        return None
+    return body[start + len(ANALYSIS_MARKER):end].strip("\n")
+
+
+def parse_state(body: str, key: bytes) -> tuple[ReviewState, str] | None:
+    """The state and analysis saved in a comment body, or None unless exactly one
+    well-formed state line is present and its signature verifies."""
     matches = _STATE_LINE.findall(body or "")
-    if len(matches) != 1 or len(matches[0]) > MAX_STATE_CHARS:
+    analysis = extract_analysis(body or "")
+    if len(matches) != 1 or len(matches[0]) > MAX_STATE_CHARS or analysis is None:
         return None
     try:
         data = json.loads(matches[0])
     except json.JSONDecodeError:
         return None
-    if not isinstance(data, dict) or set(data) != {"version", *ReviewState.__dataclass_fields__}:
+    fields = set(ReviewState.__dataclass_fields__)
+    if not isinstance(data, dict) or set(data) != {"version", "mac", *fields}:
         return None
-    if data["version"] != VERSION or isinstance(data["version"], bool):
+    # bool is an int subclass: never accept one where a number is expected.
+    if isinstance(data["version"], bool) or data["version"] != VERSION:
         return None
-    strings = ("head_sha", "reviewed_sha", "fingerprint", "tests", "risk", "confidence")
-    if not all(isinstance(data[k], str) for k in strings):
+    if not all(isinstance(data[k], str) for k in (*fields - {"uncovered"}, "mac")):
         return None
     uncovered = data["uncovered"]
     if isinstance(uncovered, bool) or not isinstance(uncovered, int) or not 0 <= uncovered <= MAX_UNCOVERED:
         return None
-    if not (_SHA.match(data["head_sha"]) and _SHA.match(data["reviewed_sha"])
-            and _FINGERPRINT.match(data["fingerprint"])):
+    if not (SHA_RE.match(data["head_sha"]) and SHA_RE.match(data["reviewed_sha"])
+            and _HEX64.match(data["fingerprint"]) and _HEX64.match(data["mac"])):
         return None
-    if data["tests"] not in TEST_STATUSES or data["risk"] not in RISKS or data["confidence"] not in CONFIDENCES:
+    if data["tests"] not in TESTS_OUTCOMES or data["risk"] not in RISKS or data["confidence"] not in CONFIDENCES:
         return None
-    return ReviewState(**{k: data[k] for k in ReviewState.__dataclass_fields__})
+    state = ReviewState(**{k: data[k] for k in fields})
+    if not hmac.compare_digest(data["mac"], _mac(key, state, analysis)):
+        return None
+    return state, analysis
 
 
 def reusable_outcome(prior: ReviewState | None, head_sha: str, fingerprint: str | None,
@@ -154,16 +169,9 @@ def reusable_outcome(prior: ReviewState | None, head_sha: str, fingerprint: str 
         return None
     if prior.head_sha == head_sha:
         return None  # a re-run of the same head asks for a fresh review
-    if prior.fingerprint != fingerprint or prior.tests != test_status(test):
+    if prior.fingerprint != fingerprint or prior.tests != tests_outcome(test):
         return None
+    # decide() only counts call sites whose covered_by_tests isn't "yes", so the saved
+    # count stands in for the call sites themselves.
     impacted = [{"covered_by_tests": "no"}] * prior.uncovered
     return ReviewOutcome(review={"risk": prior.risk, "confidence": prior.confidence, "impacted_code": impacted})
-
-
-def extract_analysis(body: str) -> str | None:
-    """Claude's analysis section from an earlier comment by this reviewer, without the markers."""
-    start = body.find(ANALYSIS_MARKER)
-    end = body.find(ANALYSIS_END)
-    if start < 0 or end < start:
-        return None
-    return body[start + len(ANALYSIS_MARKER):end].strip("\n")
