@@ -45,12 +45,18 @@ class Verdict:
     reasons: list[str]
 
 
-def decide(outcome: ReviewOutcome, test: CheckRun | None, checkout: Checkout) -> Verdict:
+NO_TESTS = "no build or tests were run (set `test-command`)"
+
+
+def decide(outcome: ReviewOutcome, test: CheckRun | None, checkout: Checkout,
+           no_test_reason: str | None = None) -> Verdict:
+    """`no_test_reason` says why `test` is None when tests did run but their result was not usable."""
     fail: list[str] = []
     human: list[str] = []
 
     if test is None:
-        human.append("No build or tests were run (set `test-command`), so nothing proves the update works.")
+        why = no_test_reason or NO_TESTS
+        human.append(f"{why[0].upper()}{why[1:]}, so nothing proves the update works.")
     elif test.timed_out:
         fail.append(f"`{test.command}` timed out.")
     elif not test.passed:

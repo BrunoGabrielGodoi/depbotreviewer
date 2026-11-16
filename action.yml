@@ -121,6 +121,15 @@ inputs:
     description: PR number. Defaults to the PR in the triggering event (set it for workflow_dispatch).
     required: false
     default: ""
+  reuse-blocking-verdict:
+    description: >-
+      Skip Claude when Dependabot only rebased the PR: same dependencies, versions and
+      update types, same build and test outcome, and the earlier review blocked it (fail
+      or needs-human). The verdict is re-decided with this run's tests; a pass is never
+      reused. Delete the reviewer's comment or re-run the job to force a full review.
+      Needs a bot account's token (the default GITHUB_TOKEN).
+    required: false
+    default: "false"
   ticket-on:
     description: >-
       Which verdicts add ready-to-paste ticket text (title and Markdown description for
@@ -230,6 +239,7 @@ runs:
         INPUT_ALLOWED_AUTHORS: ${{ inputs.allowed-authors }}
         INPUT_PR_NUMBER: ${{ inputs.pr-number }}
         INPUT_TICKET_ON: ${{ inputs.ticket-on }}
+        INPUT_REUSE_BLOCKING_VERDICT: ${{ inputs.reuse-blocking-verdict }}
       # -P stops Python from putting the working directory (the PR's code) on sys.path,
       # so a file in the reviewed repo cannot shadow one of the reviewer's imports.
       run: |

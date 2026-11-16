@@ -74,12 +74,19 @@ class GitHub:
                 return comments
             page += 1
 
-    def upsert_comment(self, number: int, body: str, marker: str) -> str:
-        """Update the comment containing `marker`, or create one. Returns its URL."""
+    def find_comment(self, number: int, marker: str) -> dict | None:
+        """The first comment containing `marker`: the one upsert_comment updates."""
         for c in self._list_comments(number):
             if marker in (c.get("body") or ""):
-                updated = self._request("PATCH", self._repo(f"/issues/comments/{c['id']}"), {"body": body})
-                return updated["html_url"]
+                return c
+        return None
+
+    def upsert_comment(self, number: int, body: str, marker: str) -> str:
+        """Update the comment containing `marker`, or create one. Returns its URL."""
+        existing = self.find_comment(number, marker)
+        if existing is not None:
+            updated = self._request("PATCH", self._repo(f"/issues/comments/{existing['id']}"), {"body": body})
+            return updated["html_url"]
         created = self._request("POST", self._repo(f"/issues/{number}/comments"), {"body": body})
         return created["html_url"]
 

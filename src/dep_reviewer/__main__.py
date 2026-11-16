@@ -8,6 +8,7 @@ import sys
 import time
 import urllib.parse
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 import anthropic
@@ -28,7 +29,23 @@ from .gate import (
 from .github_api import GitHub, GitHubError
 from .prompts import SYSTEM_PROMPT, CheckRun, build_user_message
 from .repo_tools import RepoTools
-from .report import COMMENT_MARKER, LABEL_COLORS, LABEL_DESCRIPTIONS, RenderContext, render_comment
+from .report import (
+    COMMENT_MARKER,
+    LABEL_COLORS,
+    LABEL_DESCRIPTIONS,
+    RenderContext,
+    render_comment,
+    render_reused_comment,
+)
+from .reuse import (
+    ReviewState,
+    extract_analysis,
+    parse_state,
+    render_state,
+    reusable_outcome,
+    state_from_review,
+    update_fingerprint,
+)
 from .test_result import LOG_FILE, TestResultError, checkout_for_review, load_test_result, write_test_result
 from .tickets import build_content, render_ticket_section
 
@@ -153,9 +170,19 @@ def review_pr(cfg: Config, gh: GitHub, event: dict) -> int:
         print(f"PR #{number} is by {author}, not one of {', '.join(cfg.allowed_authors)}; skipping.")
         set_output("skipped", "true")
         return 0
-    set_output("skipped", "false")
 
     head_sha, base_sha, base_ref = pr["head"]["sha"], pr["base"]["sha"], pr["base"]["ref"]
+    # A run for an older head (typically a re-run after Dependabot rebased) must not
+    # overwrite the comment, label or auto-merge state the run for the current head set.
+    event_head = ((event.get("pull_request") or {}).get("head") or {}).get("sha")
+    if event_head and event_head != head_sha:
+        print(
+            f"PR #{number} moved from {event_head[:7]} to {head_sha[:7]} since this run was triggered; "
+            "the run for the current head decides. Skipping."
+        )
+        set_output("skipped", "true")
+        return 0
+    set_output("skipped", "false")
     files = gh.list_pr_files(number)
     print(f"Reviewing PR #{number}: {pr['title']} ({len(files)} files changed)")
 
@@ -170,6 +197,7 @@ def review_pr(cfg: Config, gh: GitHub, event: dict) -> int:
             "Use actions/checkout without `ref:` on the pull_request event."
         )
 
+    no_test_reason: str | None = None
     if cfg.mode == "review":
         # The tests ran in the mode: test job; this job never runs the PR's code.
         try:
@@ -178,6 +206,7 @@ def review_pr(cfg: Config, gh: GitHub, event: dict) -> int:
         except TestResultError as e:
             print(f"::warning::No usable test result from the test job: {e}")
             test, tools.test_log = None, None
+            no_test_reason = f"the test job's result was not used ({e})"
         else:
             test, tools.test_log = result.check, result.log_path
             checkout = checkout_for_review(checkout, result.checkout_sha)
@@ -193,38 +222,16 @@ def review_pr(cfg: Config, gh: GitHub, event: dict) -> int:
             print("::warning::No test-command set: the verdict can't be a pass without a build and tests.")
         tools.test_log = test_log if test else None
 
-    user_message = build_user_message(pr, files, test, checkout.description)
-    try:
-        if cfg.uses_claude_code:
-            outcome = run_review_cli(
-                oauth_token=cfg.claude_code_oauth_token,
-                model=cfg.model,
-                effort=cfg.effort,
-                max_turns=cfg.max_turns,
-                system=SYSTEM_PROMPT,
-                user_message=user_message,
-                tools=tools,
-                work_dir=cfg.runner_temp / f"dep-review-claude-code-{number}",
-                web_fetch_domains=cfg.web_fetch_domains,
-                claude_bin=cfg.claude_bin,
-            )
-        else:
-            outcome = run_review(
-                anthropic.Anthropic(api_key=cfg.anthropic_api_key),
-                model=cfg.model,
-                effort=cfg.effort,
-                max_turns=cfg.max_turns,
-                system=SYSTEM_PROMPT,
-                user_message=user_message,
-                tools=tools,
-            )
-    except ReviewError as e:
-        print(f"::warning::Claude review incomplete: {e}")
-        outcome = ReviewOutcome(review=None, unavailable_reason=f"Claude's review could not be completed: {e}")
-    except anthropic.APIError as e:
-        # Report API failures on the PR rather than leaving it silently unreviewed.
-        print(f"::warning::Anthropic API error: {e}")
-        outcome = ReviewOutcome(review=None, unavailable_reason=f"The Claude API returned an error: {type(e).__name__}.")
+    fingerprint, prior, prior_body = None, None, ""
+    if cfg.reuse_blocking_verdict and cfg.post_comment:
+        fingerprint, prior, prior_body = load_prior_review(gh, number, head_sha)
+    reused = reuse_verdict(prior, prior_body, head_sha, fingerprint, test, checkout, no_test_reason)
+    if reused is not None:
+        outcome, verdict, analysis = reused
+        print(f"Reusing the blocking verdict from the review of {prior.reviewed_sha[:7]}: same update, same test outcome.")
+    else:
+        outcome = review_with_claude(cfg, number, pr, files, test, checkout, tools, no_test_reason)
+        verdict = decide(outcome, test, checkout, no_test_reason)
 
     u = outcome.usage
     if u:
@@ -233,7 +240,6 @@ def review_pr(cfg: Config, gh: GitHub, event: dict) -> int:
             f"cache_write={u.get('cache_creation_input_tokens', 0)} output={u.get('output_tokens', 0)}"
         )
 
-    verdict = decide(outcome, test, checkout)
     print(f"Verdict: {verdict.status}")
     for reason in verdict.reasons:
         print(f"  - {reason}")
@@ -250,11 +256,22 @@ def review_pr(cfg: Config, gh: GitHub, event: dict) -> int:
             update = parse_dependabot_metadata("")  # unknown update type, so no auto-merge
         decision = auto_merge_decision(verdict, outcome, update, cfg.auto_merge_update_types)
         print(f"Auto-merge: {'yes' if decision.merge else 'no'}, {decision.reason}")
-    body = render_comment(outcome, verdict, RenderContext(cfg.server_url, cfg.repository, cfg.model, checkout, test, run_url))
+    ctx = RenderContext(cfg.server_url, cfg.repository, cfg.model, checkout, test, run_url, no_test_reason)
+    if reused is not None:
+        body = render_reused_comment(verdict, ctx, outcome.risk, outcome.confidence, prior.reviewed_sha, analysis)
+        state: ReviewState | None = replace(prior, head_sha=head_sha)
+        # The reused outcome holds only the gate inputs, not Claude's call-site details.
+        ticket_outcome = ReviewOutcome(review=None)
+    else:
+        body = render_comment(outcome, verdict, ctx)
+        state = state_from_review(head_sha, fingerprint, test, outcome)
+        ticket_outcome = outcome
     if decision is not None:
         body += f"\n**Auto-merge:** {'✅ yes' if decision.merge else '✋ no'}, {decision.reason}.\n"
-    body += ticket_text(cfg, pr, verdict, outcome, run_url)
+    body += ticket_text(cfg, pr, verdict, ticket_outcome, run_url)
     append_summary(body)
+    if cfg.reuse_blocking_verdict and state is not None:
+        body += "\n" + render_state(state)
 
     try:
         if cfg.post_comment:
@@ -290,6 +307,74 @@ def review_pr(cfg: Config, gh: GitHub, event: dict) -> int:
         print(f"::error::Verdict is {verdict.status} (fail-on: {cfg.fail_on})")
         return 1
     return 0
+
+
+def review_with_claude(cfg: Config, number: int, pr: dict, files: list[dict], test: CheckRun | None,
+                       checkout: Checkout, tools: RepoTools, no_test_reason: str | None) -> ReviewOutcome:
+    user_message = build_user_message(pr, files, test, checkout.description, no_test_reason)
+    try:
+        if cfg.uses_claude_code:
+            return run_review_cli(
+                oauth_token=cfg.claude_code_oauth_token,
+                model=cfg.model,
+                effort=cfg.effort,
+                max_turns=cfg.max_turns,
+                system=SYSTEM_PROMPT,
+                user_message=user_message,
+                tools=tools,
+                work_dir=cfg.runner_temp / f"dep-review-claude-code-{number}",
+                web_fetch_domains=cfg.web_fetch_domains,
+                claude_bin=cfg.claude_bin,
+            )
+        return run_review(
+            anthropic.Anthropic(api_key=cfg.anthropic_api_key),
+            model=cfg.model,
+            effort=cfg.effort,
+            max_turns=cfg.max_turns,
+            system=SYSTEM_PROMPT,
+            user_message=user_message,
+            tools=tools,
+        )
+    except ReviewError as e:
+        print(f"::warning::Claude review incomplete: {e}")
+        return ReviewOutcome(review=None, unavailable_reason=f"Claude's review could not be completed: {e}")
+    except anthropic.APIError as e:
+        # Report API failures on the PR rather than leaving it silently unreviewed.
+        print(f"::warning::Anthropic API error: {e}")
+        return ReviewOutcome(review=None, unavailable_reason=f"The Claude API returned an error: {type(e).__name__}.")
+
+
+def load_prior_review(gh: GitHub, number: int, head_sha: str) -> tuple[str | None, ReviewState | None, str]:
+    """This head's update fingerprint, and the state and body of the reviewer's earlier comment.
+
+    The state is read only from a comment written by a bot account: anyone can post a
+    comment containing the marker, and a person's comment is never trusted or re-posted.
+    """
+    try:
+        fingerprint = update_fingerprint(gh.get_commit_message(head_sha))
+        comment = gh.find_comment(number, COMMENT_MARKER)
+    except GitHubError as e:
+        print(f"::warning::Could not read the earlier review, so it is not reused: {e}")
+        return None, None, ""
+    if comment is None or (comment.get("user") or {}).get("type") != "Bot":
+        return fingerprint, None, ""
+    body = comment.get("body") or ""
+    return fingerprint, parse_state(body), body
+
+
+def reuse_verdict(prior: ReviewState | None, prior_body: str, head_sha: str, fingerprint: str | None,
+                  test: CheckRun | None, checkout: Checkout,
+                  no_test_reason: str | None) -> tuple[ReviewOutcome, Verdict, str] | None:
+    """The earlier review's outcome, the verdict re-decided with it, and its analysis text,
+    when this run may skip Claude. None means: do a full review."""
+    outcome = reusable_outcome(prior, head_sha, fingerprint, test)
+    analysis = extract_analysis(prior_body) if outcome is not None else None
+    if outcome is None or analysis is None:
+        return None
+    verdict = decide(outcome, test, checkout, no_test_reason)
+    if verdict.status == PASS:
+        return None  # a pass can turn on auto-merge, so it always comes from a full review
+    return outcome, verdict, analysis
 
 
 def ticket_text(cfg: Config, pr: dict, verdict: Verdict, outcome: ReviewOutcome, run_url: str | None) -> str:
