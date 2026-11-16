@@ -106,7 +106,7 @@ Dependabot rebases every open PR whose lockfile conflicts with the base branch. 
 With `reuse-blocking-verdict: true`, a run skips Claude when all of these hold:
 
 - the PR's head moved since the last run;
-- the head commit is Dependabot's, with the same PR title and the same dependencies, versions, dependency types and update types in its metadata;
+- the head commit is Dependabot's (committed and verified by GitHub), with the same PR title and the same dependencies, versions, dependency types and update types in its metadata;
 - the build and tests had the same outcome;
 - the last review completed (a run that hit an API error or limit is never reused);
 - re-deciding with that review's risk, confidence and untested call sites, plus this run's tests and checkout, still gives `fail` or `needs-human`.
@@ -115,7 +115,7 @@ The comment keeps Claude's earlier analysis, says which head it reviewed, and sh
 
 A `pass` is never reused, because it can turn on auto-merge. Every pass comes from a full review.
 
-The state is a hidden line at the end of the reviewer's comment, signed with a key derived from the Claude credential. It is read only from a comment written by a bot account, such as the default `GITHUB_TOKEN`'s `github-actions[bot]`, and only if the signature verifies. So another bot, or a person editing the comment, can't forge it, and even a forged state could only keep a PR blocked. The option needs `post-comment: true`. With a personal access token as `github-token`, nothing is reused.
+The state is a hidden line at the end of the reviewer's comment, signed with a key derived from the Claude credential, together with the repository and PR number. It is read only from a comment written by a bot account, such as the default `GITHUB_TOKEN`'s `github-actions[bot]`, and only if the signature verifies. So another bot, or a person editing the comment, can't forge it, and even a forged state could only keep a PR blocked. The option needs `post-comment: true`. With a personal access token as `github-token`, nothing is reused.
 
 To force a full review, re-run the job. Deleting the reviewer's comment, or rotating the Claude credential, also makes the next run a full review.
 

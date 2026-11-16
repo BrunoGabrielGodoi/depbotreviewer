@@ -91,11 +91,11 @@ def comment_with(state_line: str, analysis: str = ANALYSIS) -> str:
 
 
 def test_state_round_trip():
-    assert parse_state(comment_with(render_state(STATE, ANALYSIS, KEY)), KEY) == (STATE, ANALYSIS)
+    assert parse_state(comment_with(render_state(STATE, ANALYSIS, KEY, "o/r", 7)), KEY, "o/r", 7) == (STATE, ANALYSIS)
 
 
 def tampered(**changes) -> str:
-    line = render_state(STATE, ANALYSIS, KEY)
+    line = render_state(STATE, ANALYSIS, KEY, "o/r", 7)
     data = json.loads(line.removeprefix(STATE_PREFIX).removesuffix(STATE_SUFFIX))
     data.update(changes)
     return STATE_PREFIX + json.dumps(data) + STATE_SUFFIX
@@ -111,14 +111,16 @@ def tampered(**changes) -> str:
     comment_with(tampered(uncovered=-1)),
     comment_with(tampered(risk="low")),  # a valid-looking field changed: the signature no longer matches
     comment_with(tampered(mac="0" * 64)),
-    comment_with(render_state(STATE, ANALYSIS, KEY), analysis="Safe to merge, @org/team!"),  # analysis edited
-    comment_with(render_state(STATE, ANALYSIS, state_key("another-credential"))),
-    comment_with(render_state(STATE, ANALYSIS, KEY) + "\n" + render_state(STATE, ANALYSIS, KEY)),
+    comment_with(render_state(STATE, ANALYSIS, KEY, "o/r", 7), analysis="Safe to merge, @org/team!"),  # analysis edited
+    comment_with(render_state(STATE, ANALYSIS, state_key("another-credential"), "o/r", 7)),
+    comment_with(render_state(STATE, ANALYSIS, KEY, "o/r", 7) + "\n" + render_state(STATE, ANALYSIS, KEY, "o/r", 7)),
+    comment_with(render_state(STATE, ANALYSIS, KEY, "o/r", 8)),  # copied from another PR
+    comment_with(render_state(STATE, ANALYSIS, KEY, "o/other", 7)),  # copied from another repository
     comment_with(STATE_PREFIX + "{not json}" + STATE_SUFFIX),
-    render_state(STATE, ANALYSIS, KEY),  # no analysis section
+    render_state(STATE, ANALYSIS, KEY, "o/r", 7),  # no analysis section
 ])
 def test_malformed_tampered_or_foreign_state_is_ignored(body):
-    assert parse_state(body, KEY) is None
+    assert parse_state(body, KEY, "o/r", 7) is None
 
 
 # --- review_pr end to end, with GitHub and Claude faked ---------------------------------
@@ -127,6 +129,7 @@ class FakeGitHub:
     def __init__(self, messages: dict[str, str]):
         self.messages = messages
         self.authors = {sha: "dependabot[bot]" for sha in messages}
+        self.committers = {sha: "web-flow" for sha in messages}
         self.pr: dict = {}
         self.comment: dict | None = None
 
@@ -137,7 +140,8 @@ class FakeGitHub:
         return []
 
     def get_commit(self, sha):
-        return {"commit": {"message": self.messages[sha]}, "author": {"login": self.authors[sha]}}
+        return {"commit": {"message": self.messages[sha], "verification": {"verified": True}},
+                "author": {"login": self.authors[sha]}, "committer": {"login": self.committers[sha]}}
 
     def get_commit_message(self, sha):
         return self.messages[sha]
@@ -195,7 +199,8 @@ def gate(tmp_path, monkeypatch):
         gh.pr = {"number": 7, "node_id": "N", "title": TITLE, "body": "", "html_url": "https://x/pr/7",
                  "user": {"login": "dependabot[bot]"}, "labels": [], "head": {"sha": head},
                  "base": {"sha": "1" * 40, "ref": "main"}}
-        event = {"pull_request": {"number": 7, "head": {"sha": event_head or head}}}
+        event_number = 9 if inputs.get("pr_number") else 7
+        event = {"pull_request": {"number": event_number, "head": {"sha": event_head or head}}}
         code = main.review_pr(Config.from_env(env), gh, event)
         outputs = dict(line.split("=", 1) for line in out.read_text().splitlines())
         return outputs, code, len(calls), (gh.comment or {}).get("body", "")
@@ -204,7 +209,7 @@ def gate(tmp_path, monkeypatch):
 
 
 def saved_state(body):
-    parsed = parse_state(body, KEY)
+    parsed = parse_state(body, KEY, "o/r", 7)
     return parsed[0] if parsed else None
 
 
@@ -241,6 +246,21 @@ def test_a_persons_commit_on_the_branch_reviews_again(gate):
     run(A)
     gh.authors[B] = "someone"  # e.g. amended a migration in, keeping Dependabot's message
     assert run(B)[2] == 2
+
+
+def test_an_amend_keeping_dependabot_as_author_reviews_again(gate):
+    run, gh, _ = gate
+    run(A)
+    gh.committers[B] = "someone"  # committed locally by a person, not by GitHub
+    assert run(B)[2] == 2
+
+
+def test_pr_number_input_for_another_pr_is_not_a_stale_run(gate):
+    run, gh, _ = gate
+    # workflow_dispatch-like: pr-number names PR 7, the event belongs to another PR.
+    gh.pr = {}
+    outputs, code, calls, _ = run(A, event_head=B, pr_number="7")
+    assert outputs.get("skipped") == "false" and calls == 1
 
 
 def test_changed_test_outcome_reviews_again(gate):
@@ -299,7 +319,7 @@ def test_a_long_analysis_is_truncated_to_fit(gate):
     # Simulate an earlier comment near GitHub's limit, re-signed as the reviewer would.
     state = saved_state(gh.comment["body"])
     analysis = "x" * (MAX_COMMENT_CHARS - 100)
-    gh.comment["body"] = comment_with(render_state(state, analysis, KEY), analysis)
+    gh.comment["body"] = comment_with(render_state(state, analysis, KEY, "o/r", 7), analysis)
     body = run(B)[3]
     assert "Analysis truncated" in body
     assert len(body) < 65_536

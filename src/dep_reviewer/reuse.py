@@ -8,7 +8,8 @@ question again.
 With the option on, a run skips Claude when all of these hold:
 
 - this is not a re-run for the head the last run already handled;
-- the head commit is the PR author's (Dependabot's) and has the same PR title and the
+- the head commit is the PR author's (Dependabot's), committed and verified by GitHub,
+  and has the same PR title and the
   same dependencies, target versions, dependency types and update types;
 - the build and tests had the same outcome;
 - the last review completed (an API error or limit is never saved, so never reused);
@@ -106,14 +107,16 @@ def state_from_review(head_sha: str, fingerprint: str | None, test: CheckRun | N
                        min(uncovered, MAX_UNCOVERED))
 
 
-def _mac(key: bytes, state: ReviewState, analysis: str) -> str:
-    payload = json.dumps([asdict(state), analysis], sort_keys=True).encode()
+def _mac(key: bytes, state: ReviewState, analysis: str, repository: str, number: int) -> str:
+    # The repository and PR number are signed too, so a state can't be copied to another PR
+    # (or repository sharing the credential).
+    payload = json.dumps([repository, number, asdict(state), analysis], sort_keys=True).encode()
     return hmac.new(key, payload, hashlib.sha256).hexdigest()
 
 
-def render_state(state: ReviewState, analysis: str, key: bytes) -> str:
+def render_state(state: ReviewState, analysis: str, key: bytes, repository: str, number: int) -> str:
     """The state line, signed together with the analysis section it was saved with."""
-    data = {"version": VERSION, **asdict(state), "mac": _mac(key, state, analysis)}
+    data = {"version": VERSION, **asdict(state), "mac": _mac(key, state, analysis, repository, number)}
     return STATE_PREFIX + json.dumps(data, separators=(",", ":")) + STATE_SUFFIX
 
 
@@ -126,7 +129,7 @@ def extract_analysis(body: str) -> str | None:
     return body[start + len(ANALYSIS_MARKER):end].strip("\n")
 
 
-def parse_state(body: str, key: bytes) -> tuple[ReviewState, str] | None:
+def parse_state(body: str, key: bytes, repository: str, number: int) -> tuple[ReviewState, str] | None:
     """The state and analysis saved in a comment body, or None unless exactly one
     well-formed state line is present and its signature verifies."""
     matches = _STATE_LINE.findall(body or "")
@@ -154,7 +157,7 @@ def parse_state(body: str, key: bytes) -> tuple[ReviewState, str] | None:
     if data["tests"] not in TESTS_OUTCOMES or data["risk"] not in RISKS or data["confidence"] not in CONFIDENCES:
         return None
     state = ReviewState(**{k: data[k] for k in fields})
-    if not hmac.compare_digest(data["mac"], _mac(key, state, analysis)):
+    if not hmac.compare_digest(data["mac"], _mac(key, state, analysis, repository, number)):
         return None
     return state, analysis
 

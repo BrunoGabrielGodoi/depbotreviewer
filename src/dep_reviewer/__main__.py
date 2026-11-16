@@ -177,8 +177,9 @@ def review_pr(cfg: Config, gh: GitHub, event: dict) -> int:
     # the comment, label or auto-merge state of the run for the current head. It fails
     # instead of passing: a red check on an obsolete head is harmless, but if the API is
     # what lags, this is the current head's run, and a green skip would let it merge.
-    event_head = ((event.get("pull_request") or {}).get("head") or {}).get("sha")
-    if event_head and event_head != head_sha:
+    event_pr = event.get("pull_request") or {}
+    event_head = (event_pr.get("head") or {}).get("sha")
+    if event_pr.get("number") == int(number) and event_head and event_head != head_sha:
         print(
             f"::error::This run is for {event_head[:7]}, but PR #{number} is at {head_sha[:7]}. "
             "Nothing was reviewed or changed; the run for the PR's current head decides."
@@ -279,7 +280,7 @@ def review_pr(cfg: Config, gh: GitHub, event: dict) -> int:
     # The state is for the next run, so it stays out of the job summary.
     analysis = extract_analysis(body)
     if cfg.reuse_blocking_verdict and key and state is not None and analysis is not None:
-        body += "\n" + render_state(state, analysis, key)
+        body += "\n" + render_state(state, analysis, key, cfg.repository, int(number))
 
     try:
         if cfg.post_comment:
@@ -352,6 +353,10 @@ def review_with_claude(cfg: Config, number: int, pr: dict, files: list[dict], te
         return ReviewOutcome(review=None, unavailable_reason=f"The Claude API returned an error: {type(e).__name__}.")
 
 
+# GitHub's own account, the committer of the signed commits Dependabot makes.
+GITHUB_COMMITTER = "web-flow"
+
+
 @dataclass(frozen=True)
 class PriorReview:
     fingerprint: str | None  # of this run's head; None when nothing may be reused
@@ -370,8 +375,9 @@ class ReusedVerdict:
 def load_prior_review(gh: GitHub, cfg: Config, pr: dict, key: bytes) -> PriorReview:
     """This head's update fingerprint, and the verified state of the reviewer's comment.
 
-    The fingerprint is only taken from a head commit the PR's author (Dependabot) made, so
-    a person's commit on the branch, even one keeping Dependabot's message, gets a full
+    The fingerprint is only taken from a head commit the PR's author (Dependabot) made and
+    GitHub committed and verified, as it does for Dependabot. So a person's commit on the
+    branch, even an amend that keeps Dependabot as the author and its message, gets a full
     review. The state is only read from a comment written by a bot account, and
     parse_state also checks its signature.
     """
@@ -382,12 +388,14 @@ def load_prior_review(gh: GitHub, cfg: Config, pr: dict, key: bytes) -> PriorRev
         print(f"::warning::Could not read the earlier review, so it is not reused: {e}")
         return PriorReview(None, None, "")
     author = ((commit.get("author") or {}).get("login") or "").lower()
+    committer = (commit.get("committer") or {}).get("login") or ""
+    verified = ((commit.get("commit") or {}).get("verification") or {}).get("verified") is True
     fingerprint = None
-    if author in cfg.allowed_authors:
+    if author in cfg.allowed_authors and committer == GITHUB_COMMITTER and verified:
         fingerprint = update_fingerprint(pr.get("title") or "", commit["commit"]["message"])
     if comment is None or (comment.get("user") or {}).get("type") != "Bot":
         return PriorReview(fingerprint, None, "")
-    parsed = parse_state(comment.get("body") or "", key)
+    parsed = parse_state(comment.get("body") or "", key, cfg.repository, pr["number"])
     if parsed is None:
         return PriorReview(fingerprint, None, "")
     return PriorReview(fingerprint, *parsed)
