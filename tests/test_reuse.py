@@ -24,6 +24,7 @@ PASSED = CheckRun("npm test", 0, False, 1.0, 10, "ok")
 FAILED = CheckRun("npm test", 1, False, 1.0, 10, "boom")
 TITLE = "Bump uuid from 8.3.2 to 14.0.3"
 FILES = ["package-lock.json", "package.json"]
+R = "reviewer"
 
 PASSING_REVIEW = copy.deepcopy(REVIEW)
 PASSING_REVIEW.update(risk="low", confidence="high")
@@ -54,27 +55,28 @@ UUID_14 = commit(("uuid", "14.0.3", "major"))
     "---\nupdated-dependencies:\n...",  # empty
 ])
 def test_incomplete_or_odd_metadata_gives_no_fingerprint(message):
-    assert update_fingerprint(TITLE, message, FILES) is None
+    assert update_fingerprint(TITLE, message, FILES, R) is None
 
 
 def test_fingerprint_is_order_insensitive():
     one = commit(("a", "1.0.0", "minor"), ("b", "2.0.0", "patch"))
     two = commit(("b", "2.0.0", "patch"), ("a", "1.0.0", "minor"))
-    assert update_fingerprint(TITLE, one, FILES) == update_fingerprint(TITLE, two, FILES)
+    assert update_fingerprint(TITLE, one, FILES, R) == update_fingerprint(TITLE, two, FILES, R)
 
 
 def test_fingerprint_changes_with_version_type_title_or_files():
-    base = update_fingerprint(TITLE, UUID_14, FILES)
-    assert base != update_fingerprint(TITLE, commit(("uuid", "14.0.4", "major")), FILES)
-    assert base != update_fingerprint(TITLE, UUID_14.replace("direct:production", "direct:development"), FILES)
-    assert base != update_fingerprint("Bump uuid from 9.0.0 to 14.0.3", UUID_14, FILES)  # another from-version
-    assert base != update_fingerprint(TITLE, UUID_14, [*FILES, "src/index.js"])  # touches more files
+    base = update_fingerprint(TITLE, UUID_14, FILES, R)
+    assert base != update_fingerprint(TITLE, commit(("uuid", "14.0.4", "major")), FILES, R)
+    assert base != update_fingerprint(TITLE, UUID_14.replace("direct:production", "direct:development"), FILES, R)
+    assert base != update_fingerprint("Bump uuid from 9.0.0 to 14.0.3", UUID_14, FILES, R)  # another from-version
+    assert base != update_fingerprint(TITLE, UUID_14, [*FILES, "src/index.js"], R)  # touches more files
+    assert base != update_fingerprint(TITLE, UUID_14, FILES, "another reviewer setup")
 
 
 def test_metadata_parsing_is_linear():
     # A long run of spaces in a value must not make the parser backtrack.
     message = UUID_14.replace("major", "major" + " " * 50_000 + "x")
-    assert update_fingerprint(TITLE, message, FILES) is not None
+    assert update_fingerprint(TITLE, message, FILES, R) is not None
 
 
 # --- the signed state line --------------------------------------------------------------
@@ -166,6 +168,7 @@ def gate(tmp_path, monkeypatch):
     out = tmp_path / "outputs"
     monkeypatch.setenv("GITHUB_OUTPUT", str(out))
     monkeypatch.setattr(main, "RepoTools", FakeTools)
+    monkeypatch.setattr(main.time, "sleep", lambda s: None)
     gh = FakeGitHub({A: UUID_14, B: UUID_14, C: UUID_14})
     calls: list[str] = []
     state = {"checkout": MERGE, "test": PASSED, "review": REVIEW}
@@ -350,3 +353,65 @@ def test_run_for_another_head_changes_nothing_and_fails(gate):
     assert code == 1  # never a green check: if the API lagged, this was the current head's run
     assert calls == 1
     assert gh.comment is before
+
+
+def test_failing_tests_are_never_reused(gate):
+    run, _, state = gate
+    state["test"] = FAILED
+    run(A)
+    # Same update and the tests fail again, possibly for another reason: Claude looks again.
+    assert run(B)[2] == 2
+
+
+def test_a_changed_reviewer_setup_reviews_again(gate):
+    run, _, _ = gate
+    run(A)
+    assert run(B, model="claude-sonnet-5-5")[2] == 2
+
+
+def test_a_lagging_api_is_asked_again_before_failing(gate):
+    run, gh, _ = gate
+    run(A)
+    get_pr = gh.get_pr
+    answers = iter([A])  # the first answer still has the old head, then the API catches up
+
+    def lagging_get_pr(number):
+        pr = get_pr(number)
+        lagged = next(answers, None)
+        return {**pr, "head": {"sha": lagged}} if lagged else pr
+
+    gh.get_pr = lagging_get_pr
+    outputs, code, _, _ = run(B)
+    assert outputs["skipped"] == "false" and code == 0
+
+
+def test_reused_ticket_text_carries_the_analysis(gate):
+    run, _, _ = gate
+    run(A, ticket_on="needs-human")
+    body = run(B, ticket_on="needs-human")[3]
+    ticket = body[body.index("Ticket text"):]
+    assert f"From Claude's review of `{A[:7]}`" in ticket
+    assert "Major bump of left-pad" in ticket
+
+
+def test_html_comments_in_model_text_are_broken_without_entities(gate):
+    run, _, state = gate
+    review = copy.deepcopy(REVIEW)
+    review["summary"] = "The template uses <!-- comments -->."
+    state["review"] = review
+    body = run(A, ticket_on="needs-human")[3]
+    assert "&lt;" not in body
+    assert "<!-- comments" not in body
+    assert body.count("<​!-- comments") == 2  # in the comment and in the ticket's code block
+
+
+def test_the_ticket_text_gives_way_when_the_comment_is_too_long(gate):
+    run, _, state = gate
+    review = copy.deepcopy(REVIEW)
+    review["summary"] = "s" * 30_000
+    review["test_assessment"] = "t" * 25_000
+    state["review"] = review
+    body = run(A, ticket_on="needs-human")[3]
+    assert len(body) <= 65_536
+    assert "ticket text didn't fit" in body
+    assert saved_state(body) is not None  # the state line is still there and verifies

@@ -31,6 +31,7 @@ from .prompts import SYSTEM_PROMPT, CheckRun, build_user_message
 from .repo_tools import RepoTools
 from .report import (
     COMMENT_MARKER,
+    GITHUB_COMMENT_LIMIT,
     LABEL_COLORS,
     LABEL_DESCRIPTIONS,
     MARKER_PREFIX,
@@ -45,6 +46,7 @@ from .reuse import (
     load_prior_review,
     render_state,
     reuse_verdict,
+    reviewer_identity,
     state_from_review,
     state_key,
 )
@@ -173,20 +175,29 @@ def review_pr(cfg: Config, gh: GitHub, event: dict) -> int:
         set_output("skipped", "true")
         return 0
 
-    head_sha, base_sha, base_ref = pr["head"]["sha"], pr["base"]["sha"], pr["base"]["ref"]
     # A run for another head (typically a re-run after Dependabot rebased) must not overwrite
     # the comment, label or auto-merge state of the run for the current head. It fails
     # instead of passing: a red check on an obsolete head is harmless, but if the API is
     # what lags, this is the current head's run, and a green skip would let it merge.
+    # So it asks again a few times first: right after a push, the API can briefly still
+    # return the old head, and failing then would leave the current head's check red.
     event_pr = event.get("pull_request") or {}
     event_head = (event_pr.get("head") or {}).get("sha")
-    if event_pr.get("number") == int(number) and event_head and event_head != head_sha:
-        print(
-            f"::error::This run is for {event_head[:7]}, but PR #{number} is at {head_sha[:7]}. "
-            "Nothing was reviewed or changed; the run for the PR's current head decides."
-        )
-        set_output("skipped", "true")
-        return 1
+    for wait in (*STALE_HEAD_WAITS, None):
+        if not (event_pr.get("number") == int(number) and event_head and event_head != pr["head"]["sha"]):
+            break
+        if wait is None:
+            print(
+                f"::error::This run is for {event_head[:7]}, but PR #{number} is at {pr['head']['sha'][:7]}. "
+                "Nothing was reviewed or changed; the run for the PR's current head decides."
+            )
+            set_output("skipped", "true")
+            return 1
+        print(f"PR #{number} is at {pr['head']['sha'][:7]}, not this run's {event_head[:7]}; "
+              f"asking again in {wait}s in case the API lags.")
+        time.sleep(wait)
+        pr = gh.get_pr(int(number))
+    head_sha, base_sha, base_ref = pr["head"]["sha"], pr["base"]["sha"], pr["base"]["ref"]
     set_output("skipped", "false")
     files = gh.list_pr_files(number)
     print(f"Reviewing PR #{number}: {pr['title']} ({len(files)} files changed)")
@@ -230,7 +241,9 @@ def review_pr(cfg: Config, gh: GitHub, event: dict) -> int:
     key = state_key(cfg.claude_code_oauth_token or cfg.anthropic_api_key)
     prior = NO_PRIOR
     if cfg.reuse_blocking_verdict and cfg.post_comment and key:
-        prior = load_prior_review(gh, pr, files, key, cfg.repository)
+        reviewer = reviewer_identity(cfg.model, cfg.effort, "claude-code" if cfg.uses_claude_code else "api",
+                                     SYSTEM_PROMPT)
+        prior = load_prior_review(gh, pr, files, key, cfg.repository, reviewer)
     reused = reuse_verdict(prior, head_sha, test, checkout, no_test_reason)
     if reused is not None:
         outcome, verdict = reused.outcome, reused.verdict
@@ -268,20 +281,25 @@ def review_pr(cfg: Config, gh: GitHub, event: dict) -> int:
         body = render_reused_comment(verdict, ctx, outcome.risk, outcome.confidence,
                                      reused.state.reviewed_sha, reused.analysis)
         state: ReviewState | None = replace(reused.state, head_sha=head_sha)
-        # The reused outcome holds only the gate inputs, not Claude's call-site details.
-        ticket_outcome = ReviewOutcome(review=None)
+        # The reused outcome holds only the gate inputs, so the ticket carries the earlier
+        # analysis over instead, as the comment does.
+        ticket = ticket_text(cfg, pr, verdict, outcome, run_url,
+                             carried_analysis=(reused.state.reviewed_sha, reused.analysis))
     else:
         body = render_comment(outcome, verdict, ctx)
         state = state_from_review(head_sha, prior.fingerprint, test, outcome)
-        ticket_outcome = outcome
+        ticket = ticket_text(cfg, pr, verdict, outcome, run_url)
     if decision is not None:
         body += f"\n**Auto-merge:** {'✅ yes' if decision.merge else '✋ no'}, {decision.reason}.\n"
-    body += ticket_text(cfg, pr, verdict, ticket_outcome, run_url)
-    append_summary(body)
+    append_summary(body + ticket)
     # The state is for the next run, so it stays out of the job summary.
     analysis = extract_analysis(body)
+    state_line = ""
     if cfg.reuse_blocking_verdict and key and state is not None and analysis is not None:
-        body += "\n" + render_state(state, analysis, key, cfg.repository, int(number))
+        state_line = "\n" + render_state(state, analysis, key, cfg.repository, int(number))
+    if ticket and len(body) + len(ticket) + len(state_line) > GITHUB_COMMENT_LIMIT:
+        ticket = "\n_The ticket text didn't fit in this comment; it is in the workflow run's job summary._\n"
+    body += ticket + state_line
 
     try:
         if cfg.post_comment:
@@ -354,23 +372,37 @@ def review_with_claude(cfg: Config, number: int, pr: dict, files: list[dict], te
         return ReviewOutcome(review=None, unavailable_reason=f"The Claude API returned an error: {type(e).__name__}.")
 
 
-def ticket_text(cfg: Config, pr: dict, verdict: Verdict, outcome: ReviewOutcome, run_url: str | None) -> str:
-    """Ticket title and description to paste into Linear or Jira, when the verdict calls for one."""
+def ticket_text(cfg: Config, pr: dict, verdict: Verdict, outcome: ReviewOutcome, run_url: str | None,
+                carried_analysis: tuple[str, str] | None = None) -> str:
+    """Ticket title and description to paste into Linear or Jira, when the verdict calls for one.
+
+    `carried_analysis` is (reviewed head, analysis section) when the verdict was reused: the
+    outcome then has no call-site details, so the earlier analysis stands in for them.
+    """
     if not should_fail(verdict.status, cfg.ticket_on):
         return ""
-    review = outcome.review or {}
-    untested = [
-        f"{i['file']}:{i['line']}: {i['description']}"
-        for i in review.get("impacted_code", [])
-        if i.get("covered_by_tests") != "yes"
-    ]
+    if carried_analysis is not None:
+        # The analysis lists the call sites; the reused outcome only has placeholders for them.
+        reviewed_sha, analysis = carried_analysis
+        summary = f"From Claude's review of `{reviewed_sha[:7]}`:\n\n{analysis}"
+        untested = []
+    else:
+        review = outcome.review or {}
+        summary = review.get("summary")
+        untested = [
+            f"{i['file']}:{i['line']}: {i['description']}"
+            for i in review.get("impacted_code", [])
+            if i.get("covered_by_tests") != "yes"
+        ]
     content = build_content(
         repository=cfg.repository, pr=pr, verdict=verdict.status, reasons=verdict.reasons,
-        summary=review.get("summary"), untested=untested, pr_url=pr["html_url"], run_url=run_url,
+        summary=summary, untested=untested, pr_url=pr["html_url"], run_url=run_url,
     )
     return render_ticket_section(content)
 
 
+# Pauses before asking the API again when it reports another head than the event's.
+STALE_HEAD_WAITS = (5, 10, 20)
 CHECK_WAIT_SECONDS = 20 * 60
 CHECK_POLL_SECONDS = 20
 # How many times a run re-tests on a moved base branch before leaving the PR for a human.

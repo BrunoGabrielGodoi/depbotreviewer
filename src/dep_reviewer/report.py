@@ -18,7 +18,8 @@ ANALYSIS_MARKER = f"{MARKER_PREFIX}:analysis -->"
 ANALYSIS_END = f"{MARKER_PREFIX}:analysis-end -->"
 STATE_PREFIX = f"{MARKER_PREFIX}:state "
 STATE_SUFFIX = " -->"
-# GitHub rejects comments over 65,536 characters.
+GITHUB_COMMENT_LIMIT = 65_536  # GitHub rejects longer comments
+# The rendered review's budget; the auto-merge line, ticket text and state line come after.
 MAX_COMMENT_CHARS = 60_000
 MAX_ROWS = 40
 # Room kept in a reused comment for the auto-merge line, ticket text and state line.
@@ -53,8 +54,12 @@ class RenderContext:
 
 def neutralize(text: str) -> str:
     """Stop model-written text from @-mentioning people or teams, or writing an HTML comment
-    (such as the reviewer's own hidden markers)."""
-    return re.sub(r"@(?=[A-Za-z0-9_-])", "@​", text).replace("<!--", "&lt;!--")
+    (such as the reviewer's own hidden markers).
+
+    Both are broken with a zero-width space rather than an HTML entity: the text also goes
+    into code blocks (the ticket text), where GitHub shows and copies entities literally.
+    """
+    return re.sub(r"@(?=[A-Za-z0-9_-])", "@​", text).replace("<!--", "<​!--")
 
 
 def cell(text: str) -> str:

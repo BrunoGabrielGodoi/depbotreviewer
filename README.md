@@ -108,7 +108,8 @@ With `reuse-blocking-verdict: true`, a run skips Claude when all of these hold:
 - the PR's head moved since the last run;
 - the head commit is by the PR's author (Dependabot), committed and verified by GitHub;
 - the PR title, the list of changed files, and each dependency's name, target version, dependency type and update type in Dependabot's commit metadata are unchanged;
-- the build and tests had the same outcome;
+- the reviewer setup is unchanged: `model`, `effort`, the engine (API key or Claude Code) and the reviewer's prompt, which can change when you upgrade the action;
+- the build and tests had the same outcome, and it isn't a failure or a timeout (Claude's analysis explains the failure in that run's log, and after a rebase the tests can fail for another reason);
 - the last review completed (a run that hit an API error or limit is never reused);
 - re-deciding with that review's risk, confidence and untested call sites, plus this run's tests and checkout, still gives `fail` or `needs-human`.
 
@@ -118,7 +119,7 @@ A `pass` is never reused, because it can turn on auto-merge. Every pass comes fr
 
 The state is a hidden line at the end of the reviewer's comment, signed with a key derived from the Claude credential, together with the repository and PR number. It is read only from a comment written by a bot account, such as the default `GITHUB_TOKEN`'s `github-actions[bot]`, and only if the signature verifies. So another bot, or a person editing the comment, can't forge it, and even a forged state could only keep a PR blocked. The option needs `post-comment: true`. With a personal access token as `github-token`, nothing is reused.
 
-To force a full review, re-run the job. Deleting the reviewer's comment, or rotating the Claude credential, also makes the next run a full review.
+To force a full review, re-run the job. Deleting the reviewer's comment, changing the reviewer setup, or rotating the Claude credential also makes the next run a full review.
 
 ## Ticket text for Linear or Jira
 

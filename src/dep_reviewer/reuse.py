@@ -56,9 +56,18 @@ def state_key(credential: str) -> bytes | None:
     return hmac.new(credential.encode(), _KEY_CONTEXT, hashlib.sha256).digest()
 
 
-def update_fingerprint(pr_title: str, commit_message: str, changed_files: list[str]) -> str | None:
-    """A hash of what the PR proposes: its title, the files it changes, and every dependency's
-    name, target version, dependency type and update type from Dependabot's commit metadata.
+def reviewer_identity(model: str, effort: str, engine: str, system_prompt: str) -> str:
+    """What produced a review: a change to any of these (such as a stronger model, or an
+    upgrade that changes the prompt) must not reuse a verdict from the old setup."""
+    prompt_hash = hashlib.sha256(system_prompt.encode()).hexdigest()
+    return json.dumps([model, effort, engine, prompt_hash])
+
+
+def update_fingerprint(pr_title: str, commit_message: str, changed_files: list[str],
+                       reviewer: str) -> str | None:
+    """A hash of what the PR proposes and who reviews it: its title, the files it changes,
+    every dependency's name, target version, dependency type and update type from
+    Dependabot's commit metadata, and the reviewer setup (see reviewer_identity).
 
     The title carries the from-version and the directory. File contents aren't hashed:
     a rebase rewrites the lockfile. None when the metadata is missing or incomplete:
@@ -67,7 +76,7 @@ def update_fingerprint(pr_title: str, commit_message: str, changed_files: list[s
     entries = parse_update_entries(commit_message)
     if entries is None:
         return None
-    canonical = [pr_title, sorted(changed_files), sorted(
+    canonical = [reviewer, pr_title, sorted(changed_files), sorted(
         (e["dependency-name"], e["dependency-version"], e["dependency-type"], e["update-type"]) for e in entries
     )]
     return hashlib.sha256(json.dumps(canonical).encode()).hexdigest()
@@ -173,6 +182,11 @@ def reusable_outcome(prior: ReviewState | None, head_sha: str, fingerprint: str 
         return None
     if prior.head_sha == head_sha:
         return None  # a re-run of the same head asks for a fresh review
+    if tests_outcome(test) in ("failed", "timed-out"):
+        # Claude's analysis explains the failure in that run's log. After a rebase the
+        # tests can fail for another reason (such as a clash with the new base), which only
+        # a fresh review sees.
+        return None
     if prior.fingerprint != fingerprint or prior.tests != tests_outcome(test):
         return None
     # decide() only counts call sites whose covered_by_tests isn't "yes", so the saved
@@ -199,7 +213,8 @@ class ReusedVerdict:
     analysis: str
 
 
-def load_prior_review(gh: GitHub, pr: dict, files: list[dict], key: bytes, repository: str) -> PriorReview:
+def load_prior_review(gh: GitHub, pr: dict, files: list[dict], key: bytes, repository: str,
+                      reviewer: str) -> PriorReview:
     """This head's update fingerprint, and the verified state of the reviewer's comment.
 
     The fingerprint is only taken from a head commit by the PR's own author (Dependabot)
@@ -220,7 +235,7 @@ def load_prior_review(gh: GitHub, pr: dict, files: list[dict], key: bytes, repos
     fingerprint = None
     if author == pr["user"]["login"].lower() and committer == GITHUB_COMMITTER and verified:
         fingerprint = update_fingerprint(pr.get("title") or "", commit["commit"]["message"],
-                                         [f["filename"] for f in files])
+                                         [f["filename"] for f in files], reviewer)
     if comment is None or (comment.get("user") or {}).get("type") != "Bot":
         return PriorReview(fingerprint, None, "")
     parsed = parse_state(comment.get("body") or "", key, repository, pr["number"])
