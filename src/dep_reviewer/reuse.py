@@ -5,16 +5,8 @@ dependency change merged into the base re-runs the whole gate on every open PR. 
 update that needs a migration the verdict doesn't change, and Claude is asked the same
 question again.
 
-With the option on, a run skips Claude when all of these hold:
-
-- this is not a re-run for the head the last run already handled;
-- the head commit is the PR author's (Dependabot's), committed and verified by GitHub,
-  and has the same PR title and the
-  same dependencies, target versions, dependency types and update types;
-- the build and tests had the same outcome;
-- the last review completed (an API error or limit is never saved, so never reused);
-- re-deciding with the earlier review's risk, confidence and untested call sites, and
-  this run's tests and checkout, gives fail or needs-human.
+With the option on, a run skips Claude when Dependabot only rebased a PR the last review
+blocked; README.md, "Skipping Claude when Dependabot only rebased", lists the conditions.
 
 A pass is never reused: it can turn on auto-merge, so it always comes from a full review.
 
@@ -35,9 +27,10 @@ import re
 from dataclasses import asdict, dataclass
 
 from .claude_review import ReviewOutcome
-from .gate import parse_update_entries
+from .gate import PASS, Checkout, Verdict, decide, parse_update_entries
+from .github_api import GitHub, GitHubError
 from .prompts import CheckRun
-from .report import ANALYSIS_END, ANALYSIS_MARKER, STATE_PREFIX, STATE_SUFFIX
+from .report import ANALYSIS_END, ANALYSIS_MARKER, COMMENT_MARKER, STATE_PREFIX, STATE_SUFFIX
 from .test_result import SHA_RE
 
 VERSION = 1
@@ -50,7 +43,10 @@ CONFIDENCES = ("low", "medium", "high")
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _STATE_LINE = re.compile(re.escape(STATE_PREFIX) + r"(\{[^\n]*\})" + re.escape(STATE_SUFFIX))
+# Versioned on its own: changing it invalidates every saved state, independently of VERSION.
 _KEY_CONTEXT = b"claude-dependabot-reviewer reuse-blocking-verdict state v1"
+# GitHub's own account, the committer of the verified commits Dependabot makes.
+GITHUB_COMMITTER = "web-flow"
 
 
 def state_key(credential: str) -> bytes | None:
@@ -60,17 +56,18 @@ def state_key(credential: str) -> bytes | None:
     return hmac.new(credential.encode(), _KEY_CONTEXT, hashlib.sha256).digest()
 
 
-def update_fingerprint(pr_title: str, commit_message: str) -> str | None:
-    """A hash of what the PR proposes: its title and every dependency's name, target version,
-    dependency type and update type, from Dependabot's commit metadata.
+def update_fingerprint(pr_title: str, commit_message: str, changed_files: list[str]) -> str | None:
+    """A hash of what the PR proposes: its title, the files it changes, and every dependency's
+    name, target version, dependency type and update type from Dependabot's commit metadata.
 
-    The title carries the from-version and the directory. None when the metadata is
-    missing or incomplete: then nothing proves two heads propose the same update.
+    The title carries the from-version and the directory. File contents aren't hashed:
+    a rebase rewrites the lockfile. None when the metadata is missing or incomplete:
+    then nothing proves two heads propose the same update.
     """
     entries = parse_update_entries(commit_message)
     if entries is None:
         return None
-    canonical = [pr_title, sorted(
+    canonical = [pr_title, sorted(changed_files), sorted(
         (e["dependency-name"], e["dependency-version"], e["dependency-type"], e["update-type"]) for e in entries
     )]
     return hashlib.sha256(json.dumps(canonical).encode()).hexdigest()
@@ -136,9 +133,13 @@ def parse_state(body: str, key: bytes, repository: str, number: int) -> tuple[Re
     analysis = extract_analysis(body or "")
     if len(matches) != 1 or len(matches[0]) > MAX_STATE_CHARS or analysis is None:
         return None
+    # The real state is one flat object. Refusing anything nested before parsing also keeps
+    # a deeply nested line from exhausting the parser's recursion limit.
+    if matches[0].count("{") != 1 or "[" in matches[0]:
+        return None
     try:
         data = json.loads(matches[0])
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         return None
     fields = set(ReviewState.__dataclass_fields__)
     if not isinstance(data, dict) or set(data) != {"version", "mac", *fields}:
@@ -178,3 +179,63 @@ def reusable_outcome(prior: ReviewState | None, head_sha: str, fingerprint: str 
     # count stands in for the call sites themselves.
     impacted = [{"covered_by_tests": "no"}] * prior.uncovered
     return ReviewOutcome(review={"risk": prior.risk, "confidence": prior.confidence, "impacted_code": impacted})
+
+
+@dataclass(frozen=True)
+class PriorReview:
+    fingerprint: str | None  # of this run's head; None when nothing may be reused
+    state: ReviewState | None  # saved by the run that wrote the reviewer's comment
+    analysis: str  # the analysis section that state vouches for
+
+
+NO_PRIOR = PriorReview(None, None, "")
+
+
+@dataclass(frozen=True)
+class ReusedVerdict:
+    outcome: ReviewOutcome  # the earlier review's gate inputs only
+    verdict: Verdict  # re-decided with this run's tests and checkout
+    state: ReviewState
+    analysis: str
+
+
+def load_prior_review(gh: GitHub, pr: dict, files: list[dict], key: bytes, repository: str) -> PriorReview:
+    """This head's update fingerprint, and the verified state of the reviewer's comment.
+
+    The fingerprint is only taken from a head commit by the PR's own author (Dependabot)
+    that GitHub committed and verified, as it does for Dependabot. So a person's commit on
+    the branch, even an amend that keeps Dependabot as the author and its message, gets a
+    full review. The state is only read from a comment written by a bot account, and
+    parse_state also checks its signature.
+    """
+    try:
+        commit = gh.get_commit(pr["head"]["sha"])
+        comment = gh.find_comment(pr["number"], COMMENT_MARKER)
+    except GitHubError as e:
+        print(f"::warning::Could not read the earlier review, so it is not reused: {e}")
+        return NO_PRIOR
+    author = ((commit.get("author") or {}).get("login") or "").lower()
+    committer = (commit.get("committer") or {}).get("login") or ""
+    verified = ((commit.get("commit") or {}).get("verification") or {}).get("verified") is True
+    fingerprint = None
+    if author == pr["user"]["login"].lower() and committer == GITHUB_COMMITTER and verified:
+        fingerprint = update_fingerprint(pr.get("title") or "", commit["commit"]["message"],
+                                         [f["filename"] for f in files])
+    if comment is None or (comment.get("user") or {}).get("type") != "Bot":
+        return PriorReview(fingerprint, None, "")
+    parsed = parse_state(comment.get("body") or "", key, repository, pr["number"])
+    if parsed is None:
+        return PriorReview(fingerprint, None, "")
+    return PriorReview(fingerprint, *parsed)
+
+
+def reuse_verdict(prior: PriorReview, head_sha: str, test: CheckRun | None, checkout: Checkout,
+                  no_test_reason: str | None) -> ReusedVerdict | None:
+    """The earlier verdict, re-decided, when this run may skip Claude. None means: review in full."""
+    outcome = reusable_outcome(prior.state, head_sha, prior.fingerprint, test)
+    if outcome is None:
+        return None
+    verdict = decide(outcome, test, checkout, no_test_reason)
+    if verdict.status == PASS:
+        return None  # a pass can turn on auto-merge, so it always comes from a full review
+    return ReusedVerdict(outcome, verdict, prior.state, prior.analysis)

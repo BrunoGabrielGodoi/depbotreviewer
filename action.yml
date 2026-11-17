@@ -149,7 +149,9 @@ outputs:
     description: "Claude's confidence in the verdict: low, medium or high."
     value: ${{ steps.review.outputs.confidence }}
   skipped:
-    description: "true when the PR was not by an allowed author."
+    description: >-
+      true when the PR was not by an allowed author (the check passes), or when the run
+      is for an older head than the PR's current one (the check fails; nothing is changed).
     value: ${{ steps.review.outputs.skipped }}
   auto-merge:
     description: "true when the PR qualified for auto-merge."

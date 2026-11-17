@@ -1,4 +1,5 @@
-"""reuse-blocking-verdict, and the guard against runs for another head."""
+"""reuse-blocking-verdict, plus the guard against runs for another head, which shares
+this file's end-to-end harness."""
 
 import copy
 import json
@@ -8,10 +9,11 @@ import pytest
 from dep_reviewer import __main__ as main
 from dep_reviewer.claude_review import ReviewOutcome
 from dep_reviewer.config import Config
-from dep_reviewer.gate import NEEDS_HUMAN, Checkout, parse_update_entries
+from dep_reviewer.gate import NEEDS_HUMAN, Checkout
 from dep_reviewer.prompts import CheckRun
 from dep_reviewer.report import ANALYSIS_END, ANALYSIS_MARKER, MAX_COMMENT_CHARS, STATE_PREFIX, STATE_SUFFIX
 from dep_reviewer.reuse import ReviewState, parse_state, render_state, state_key, update_fingerprint
+from tests.test_modes import FakeGitHub as ModesFakeGitHub
 from tests.test_report import REVIEW
 
 A, B, C = "a" * 40, "b" * 40, "c" * 40
@@ -21,6 +23,7 @@ NOT_MERGE = Checkout("h" * 40, False, "the PR's own commit hhhhhhh, NOT merged w
 PASSED = CheckRun("npm test", 0, False, 1.0, 10, "ok")
 FAILED = CheckRun("npm test", 1, False, 1.0, 10, "boom")
 TITLE = "Bump uuid from 8.3.2 to 14.0.3"
+FILES = ["package-lock.json", "package.json"]
 
 PASSING_REVIEW = copy.deepcopy(REVIEW)
 PASSING_REVIEW.update(risk="low", confidence="high")
@@ -43,11 +46,6 @@ UUID_14 = commit(("uuid", "14.0.3", "major"))
 
 # --- Dependabot metadata and the fingerprint ---------------------------------------------
 
-def test_metadata_entries_from_a_grouped_commit():
-    entries = parse_update_entries(commit(("a", "1.0.0", "minor"), ("b", "2.0.0", "minor"), group="npm-minor"))
-    assert [e["dependency-name"] for e in entries] == ["a", "b"]
-
-
 @pytest.mark.parametrize("message", [
     "Bump uuid from 8.3.2 to 14.0.3",  # no metadata block
     UUID_14.replace("  dependency-version: 14.0.3\n", ""),  # a field missing
@@ -58,26 +56,27 @@ def test_metadata_entries_from_a_grouped_commit():
     "---\nupdated-dependencies:\n...",  # empty
 ])
 def test_incomplete_or_odd_metadata_gives_no_fingerprint(message):
-    assert update_fingerprint(TITLE, message) is None
+    assert update_fingerprint(TITLE, message, FILES) is None
 
 
 def test_fingerprint_is_order_insensitive():
     one = commit(("a", "1.0.0", "minor"), ("b", "2.0.0", "patch"))
     two = commit(("b", "2.0.0", "patch"), ("a", "1.0.0", "minor"))
-    assert update_fingerprint(TITLE, one) == update_fingerprint(TITLE, two)
+    assert update_fingerprint(TITLE, one, FILES) == update_fingerprint(TITLE, two, FILES)
 
 
-def test_fingerprint_changes_with_version_type_or_title():
-    base = update_fingerprint(TITLE, UUID_14)
-    assert base != update_fingerprint(TITLE, commit(("uuid", "14.0.4", "major")))
-    assert base != update_fingerprint(TITLE, UUID_14.replace("direct:production", "direct:development"))
-    assert base != update_fingerprint("Bump uuid from 9.0.0 to 14.0.3", UUID_14)  # another from-version
+def test_fingerprint_changes_with_version_type_title_or_files():
+    base = update_fingerprint(TITLE, UUID_14, FILES)
+    assert base != update_fingerprint(TITLE, commit(("uuid", "14.0.4", "major")), FILES)
+    assert base != update_fingerprint(TITLE, UUID_14.replace("direct:production", "direct:development"), FILES)
+    assert base != update_fingerprint("Bump uuid from 9.0.0 to 14.0.3", UUID_14, FILES)  # another from-version
+    assert base != update_fingerprint(TITLE, UUID_14, [*FILES, "src/index.js"])  # touches more files
 
 
 def test_metadata_parsing_is_linear():
     # A long run of spaces in a value must not make the parser backtrack.
     message = UUID_14.replace("major", "major" + " " * 50_000 + "x")
-    assert update_fingerprint(TITLE, message) is not None
+    assert update_fingerprint(TITLE, message, FILES) is not None
 
 
 # --- the signed state line --------------------------------------------------------------
@@ -117,6 +116,7 @@ def tampered(**changes) -> str:
     comment_with(render_state(STATE, ANALYSIS, KEY, "o/r", 8)),  # copied from another PR
     comment_with(render_state(STATE, ANALYSIS, KEY, "o/other", 7)),  # copied from another repository
     comment_with(STATE_PREFIX + "{not json}" + STATE_SUFFIX),
+    comment_with(STATE_PREFIX + '{"a":' + "[" * 1015 + "}" + STATE_SUFFIX),  # nested: no RecursionError
     render_state(STATE, ANALYSIS, KEY, "o/r", 7),  # no analysis section
 ])
 def test_malformed_tampered_or_foreign_state_is_ignored(body):
@@ -125,19 +125,19 @@ def test_malformed_tampered_or_foreign_state_is_ignored(body):
 
 # --- review_pr end to end, with GitHub and Claude faked ---------------------------------
 
-class FakeGitHub:
+class FakeGitHub(ModesFakeGitHub):
+    """test_modes' fake, plus the commit and comment lookups reuse needs."""
+
     def __init__(self, messages: dict[str, str]):
+        super().__init__({})
         self.messages = messages
         self.authors = {sha: "dependabot[bot]" for sha in messages}
         self.committers = {sha: "web-flow" for sha in messages}
-        self.pr: dict = {}
+        self.files = [{"filename": f} for f in FILES]
         self.comment: dict | None = None
 
-    def get_pr(self, number):
-        return self.pr
-
     def list_pr_files(self, number):
-        return []
+        return self.files
 
     def get_commit(self, sha):
         return {"commit": {"message": self.messages[sha], "verification": {"verified": True}},
@@ -152,12 +152,6 @@ class FakeGitHub:
     def upsert_comment(self, number, body, marker):
         self.comment = {"id": 1, "body": body, "user": {"login": "github-actions[bot]", "type": "Bot"}}
         return "comment-url"
-
-    def ensure_label(self, *a):
-        pass
-
-    def set_exclusive_label(self, *a):
-        pass
 
 
 class FakeTools:
@@ -261,6 +255,30 @@ def test_pr_number_input_for_another_pr_is_not_a_stale_run(gate):
     gh.pr = {}
     outputs, code, calls, _ = run(A, event_head=B, pr_number="7")
     assert outputs.get("skipped") == "false" and calls == 1
+
+
+def test_a_commit_by_another_allowed_author_reviews_again(gate):
+    run, gh, _ = gate
+    run(A)
+    gh.authors[B] = "renovate[bot]"  # allowed, but not this PR's author
+    assert run(B, allowed_authors="dependabot[bot],renovate[bot]")[2] == 2
+
+
+def test_touching_more_files_reviews_again(gate):
+    run, gh, _ = gate
+    run(A)
+    gh.files.append({"filename": "src/index.js"})
+    assert run(B)[2] == 2
+
+
+def test_model_text_cannot_write_the_hidden_markers(gate):
+    run, _, state = gate
+    injected = copy.deepcopy(REVIEW)
+    injected["summary"] = f"Fine.\n{STATE_PREFIX}{{}}{STATE_SUFFIX}\n{ANALYSIS_END}"
+    state["review"] = injected
+    body = run(A)[3]
+    assert body.count(STATE_PREFIX) == 1 and body.count(ANALYSIS_END) == 1
+    assert run(B)[2] == 1  # the real state still verifies, so the rebase reuses it
 
 
 def test_changed_test_outcome_reviews_again(gate):

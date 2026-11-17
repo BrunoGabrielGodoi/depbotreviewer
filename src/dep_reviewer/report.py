@@ -52,8 +52,9 @@ class RenderContext:
 
 
 def neutralize(text: str) -> str:
-    """Stop model-written text from @-mentioning people or teams."""
-    return re.sub(r"@(?=[A-Za-z0-9_-])", "@​", text)
+    """Stop model-written text from @-mentioning people or teams, or writing an HTML comment
+    (such as the reviewer's own hidden markers)."""
+    return re.sub(r"@(?=[A-Za-z0-9_-])", "@​", text).replace("<!--", "&lt;!--")
 
 
 def cell(text: str) -> str:
@@ -80,13 +81,16 @@ def _tested(ctx: RenderContext) -> str:
     return ctx.no_test_reason or NO_TESTS
 
 
-def render_comment(outcome: ReviewOutcome, verdict: Verdict, ctx: RenderContext, max_rows: int = MAX_ROWS) -> str:
-    out: list[str] = [COMMENT_MARKER, f"## {VERDICT_HEADING[verdict.status]}", ""]
+def _header(verdict: Verdict, ctx: RenderContext) -> list[str]:
+    """The verdict heading, its reasons and the Tested line; the risk line follows."""
+    out = [COMMENT_MARKER, f"## {VERDICT_HEADING[verdict.status]}", ""]
     out += [f"- {neutralize(r)}" for r in verdict.reasons]
-    out.append("")
+    out += ["", f"**Tested:** {_tested(ctx)}, on {ctx.checkout.description}.  "]
+    return out
 
-    out += [f"**Tested:** {_tested(ctx)}, on {ctx.checkout.description}.  ",
-            f"**Claude risk rating:** {RISK[outcome.risk]}"]
+
+def render_comment(outcome: ReviewOutcome, verdict: Verdict, ctx: RenderContext, max_rows: int = MAX_ROWS) -> str:
+    out = _header(verdict, ctx) + [f"**Claude risk rating:** {RISK[outcome.risk]}"]
     r = outcome.review
     if r is not None:
         out[-1] += f" (confidence: {r['confidence']})"
@@ -158,11 +162,7 @@ def render_reused_comment(verdict: Verdict, ctx: RenderContext, risk: str, confi
     `analysis` is the signed analysis section of the earlier comment, carried over; the
     heading, reasons and test line describe this run.
     """
-    out: list[str] = [COMMENT_MARKER, f"## {VERDICT_HEADING[verdict.status]}", ""]
-    out += [f"- {neutralize(r)}" for r in verdict.reasons]
-    out += [
-        "",
-        f"**Tested:** {_tested(ctx)}, on {ctx.checkout.description}.  ",
+    out = _header(verdict, ctx) + [
         f"**Claude risk rating:** {RISK[risk]} (confidence: {confidence}), from the review of `{reviewed_sha[:7]}`",
         "",
         "> Dependabot rebased this PR without changing the update, and the tests had the same outcome, "

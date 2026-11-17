@@ -156,7 +156,7 @@ def build_user_message(pr: dict, files: list[dict], test: CheckRun | None, check
         parts.append("Diffs of the non-lockfile changes:\n" + "\n\n".join(inline))
 
     if test is None and no_test_reason:
-        parts.append(f"Tests: no usable result for this review: {no_test_reason}.")
+        parts.append(f"Tests: no usable result for this review ({no_test_reason}).")
     elif test is None:
         parts.append("Tests: not run for this review (no test-command was configured).")
     else:

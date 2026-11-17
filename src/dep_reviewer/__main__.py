@@ -8,7 +8,7 @@ import sys
 import time
 import urllib.parse
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 
 import anthropic
@@ -32,20 +32,21 @@ from .repo_tools import RepoTools
 from .report import (
     COMMENT_MARKER,
     LABEL_COLORS,
+    MARKER_PREFIX,
     LABEL_DESCRIPTIONS,
     RenderContext,
     render_comment,
     render_reused_comment,
 )
 from .reuse import (
+    NO_PRIOR,
     ReviewState,
     extract_analysis,
-    parse_state,
+    load_prior_review,
     render_state,
-    reusable_outcome,
+    reuse_verdict,
     state_from_review,
     state_key,
-    update_fingerprint,
 )
 from .test_result import LOG_FILE, TestResultError, checkout_for_review, load_test_result, write_test_result
 from .tickets import build_content, render_ticket_section
@@ -227,9 +228,9 @@ def review_pr(cfg: Config, gh: GitHub, event: dict) -> int:
         tools.test_log = test_log if test else None
 
     key = state_key(cfg.claude_code_oauth_token or cfg.anthropic_api_key)
-    prior = PriorReview(None, None, "")
+    prior = NO_PRIOR
     if cfg.reuse_blocking_verdict and cfg.post_comment and key:
-        prior = load_prior_review(gh, cfg, pr, key)
+        prior = load_prior_review(gh, pr, files, key, cfg.repository)
     reused = reuse_verdict(prior, head_sha, test, checkout, no_test_reason)
     if reused is not None:
         outcome, verdict = reused.outcome, reused.verdict
@@ -353,66 +354,6 @@ def review_with_claude(cfg: Config, number: int, pr: dict, files: list[dict], te
         return ReviewOutcome(review=None, unavailable_reason=f"The Claude API returned an error: {type(e).__name__}.")
 
 
-# GitHub's own account, the committer of the signed commits Dependabot makes.
-GITHUB_COMMITTER = "web-flow"
-
-
-@dataclass(frozen=True)
-class PriorReview:
-    fingerprint: str | None  # of this run's head; None when nothing may be reused
-    state: ReviewState | None  # saved by the run that wrote the reviewer's comment
-    analysis: str  # the analysis section that state vouches for
-
-
-@dataclass(frozen=True)
-class ReusedVerdict:
-    outcome: ReviewOutcome  # the earlier review's gate inputs only
-    verdict: Verdict  # re-decided with this run's tests and checkout
-    state: ReviewState
-    analysis: str
-
-
-def load_prior_review(gh: GitHub, cfg: Config, pr: dict, key: bytes) -> PriorReview:
-    """This head's update fingerprint, and the verified state of the reviewer's comment.
-
-    The fingerprint is only taken from a head commit the PR's author (Dependabot) made and
-    GitHub committed and verified, as it does for Dependabot. So a person's commit on the
-    branch, even an amend that keeps Dependabot as the author and its message, gets a full
-    review. The state is only read from a comment written by a bot account, and
-    parse_state also checks its signature.
-    """
-    try:
-        commit = gh.get_commit(pr["head"]["sha"])
-        comment = gh.find_comment(pr["number"], COMMENT_MARKER)
-    except GitHubError as e:
-        print(f"::warning::Could not read the earlier review, so it is not reused: {e}")
-        return PriorReview(None, None, "")
-    author = ((commit.get("author") or {}).get("login") or "").lower()
-    committer = (commit.get("committer") or {}).get("login") or ""
-    verified = ((commit.get("commit") or {}).get("verification") or {}).get("verified") is True
-    fingerprint = None
-    if author in cfg.allowed_authors and committer == GITHUB_COMMITTER and verified:
-        fingerprint = update_fingerprint(pr.get("title") or "", commit["commit"]["message"])
-    if comment is None or (comment.get("user") or {}).get("type") != "Bot":
-        return PriorReview(fingerprint, None, "")
-    parsed = parse_state(comment.get("body") or "", key, cfg.repository, pr["number"])
-    if parsed is None:
-        return PriorReview(fingerprint, None, "")
-    return PriorReview(fingerprint, *parsed)
-
-
-def reuse_verdict(prior: PriorReview, head_sha: str, test: CheckRun | None, checkout: Checkout,
-                  no_test_reason: str | None) -> ReusedVerdict | None:
-    """The earlier verdict, re-decided, when this run may skip Claude. None means: review in full."""
-    outcome = reusable_outcome(prior.state, head_sha, prior.fingerprint, test)
-    if outcome is None:
-        return None
-    verdict = decide(outcome, test, checkout, no_test_reason)
-    if verdict.status == PASS:
-        return None  # a pass can turn on auto-merge, so it always comes from a full review
-    return ReusedVerdict(outcome, verdict, prior.state, prior.analysis)
-
-
 def ticket_text(cfg: Config, pr: dict, verdict: Verdict, outcome: ReviewOutcome, run_url: str | None) -> str:
     """Ticket title and description to paste into Linear or Jira, when the verdict calls for one."""
     if not should_fail(verdict.status, cfg.ticket_on):
@@ -434,7 +375,7 @@ CHECK_WAIT_SECONDS = 20 * 60
 CHECK_POLL_SECONDS = 20
 # How many times a run re-tests on a moved base branch before leaving the PR for a human.
 MAX_RETESTS = 3
-RETEST_MARKER = "<!-- claude-dependabot-reviewer:retest -->"
+RETEST_MARKER = f"{MARKER_PREFIX}:retest -->"
 
 # Re-runs test-command on the PR merged into a newer base commit; True if it passed.
 Retest = Callable[[str], bool]

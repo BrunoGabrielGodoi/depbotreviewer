@@ -106,7 +106,8 @@ Dependabot rebases every open PR whose lockfile conflicts with the base branch. 
 With `reuse-blocking-verdict: true`, a run skips Claude when all of these hold:
 
 - the PR's head moved since the last run;
-- the head commit is Dependabot's (committed and verified by GitHub), with the same PR title and the same dependencies, versions, dependency types and update types in its metadata;
+- the head commit is by the PR's author (Dependabot), committed and verified by GitHub;
+- the PR title, the list of changed files, and each dependency's name, target version, dependency type and update type in Dependabot's commit metadata are unchanged;
 - the build and tests had the same outcome;
 - the last review completed (a run that hit an API error or limit is never reused);
 - re-deciding with that review's risk, confidence and untested call sites, plus this run's tests and checkout, still gives `fail` or `needs-human`.
@@ -156,7 +157,7 @@ No tracker credentials are needed, because the action never calls Linear or Jira
 | `ticket-on` | `fail` | Which verdicts add ticket text for Linear or Jira to the PR comment: `fail`, `needs-human` or `never`. |
 | `reuse-blocking-verdict` | `false` | Skip Claude when Dependabot only rebased a PR that the last review blocked. See [Skipping Claude when Dependabot only rebased](#skipping-claude-when-dependabot-only-rebased-optional). |
 
-**Outputs:** `verdict` (`pass`, `needs-human` or `fail`), `risk` (`low`, `medium`, `high` or `unknown`), `confidence`, `skipped`, `auto-merge` (whether the PR qualified) and `merged` (whether this run merged it).
+**Outputs:** `verdict` (`pass`, `needs-human` or `fail`), `risk` (`low`, `medium`, `high` or `unknown`), `confidence`, `skipped` (`true` when the PR's author isn't allowed, which passes, or when the run is for an older head than the PR's current one, which fails), `auto-merge` (whether the PR qualified) and `merged` (whether this run merged it).
 
 ## Security
 
