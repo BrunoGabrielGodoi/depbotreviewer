@@ -5,7 +5,16 @@ import pytest
 
 from dep_reviewer.claude_review import ReviewOutcome
 from dep_reviewer.config import should_fail
-from dep_reviewer.gate import parse_update_entries, FAIL, NEEDS_HUMAN, PASS, Checkout, decide, describe_checkout, pr_number_from_queue_ref
+from dep_reviewer.gate import (
+    FAIL,
+    NEEDS_HUMAN,
+    PASS,
+    Checkout,
+    decide,
+    describe_checkout,
+    parse_update_entries,
+    pr_number_from_queue_ref,
+)
 from dep_reviewer.prompts import CheckRun
 from dep_reviewer.report import RenderContext, render_comment
 from tests.test_report import REVIEW

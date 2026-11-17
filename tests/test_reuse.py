@@ -31,13 +31,11 @@ for item in PASSING_REVIEW["impacted_code"]:
     item["covered_by_tests"] = "yes"
 
 
-def commit(*deps: tuple[str, str, str], group: str | None = None) -> str:
+def commit(*deps: tuple[str, str, str]) -> str:
     lines = ["Bump things", "", "---", "updated-dependencies:"]
     for name, version, kind in deps:
         lines += [f'- dependency-name: "{name}"', f"  dependency-version: {version}",
                   "  dependency-type: direct:production", f"  update-type: version-update:semver-{kind}"]
-        if group:
-            lines.append(f"  dependency-group: {group}")
     return "\n".join(lines + ["...", "", "Signed-off-by: dependabot[bot]"])
 
 

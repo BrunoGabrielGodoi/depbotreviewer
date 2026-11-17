@@ -32,8 +32,8 @@ from .repo_tools import RepoTools
 from .report import (
     COMMENT_MARKER,
     LABEL_COLORS,
-    MARKER_PREFIX,
     LABEL_DESCRIPTIONS,
+    MARKER_PREFIX,
     RenderContext,
     render_comment,
     render_reused_comment,
